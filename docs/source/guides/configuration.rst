@@ -12,8 +12,20 @@ at ``example/config.sample``
   {
     "block_store_path": "/tmp/block_store/",
     "torii_port": 50051,
+    "torii_tls_params": {
+      "port": "55552",
+      "key_pair_path": "/path/to/the/keypair"
+    },
     "internal_port": 10001,
     "pg_opt": "host=localhost port=5432 user=postgres password=mysecretpassword dbname=iroha",
+    "database": {
+      "host": "localhost",
+      "port": 5432,
+      "user": "postgres",
+      "password": "mysecretpassword",
+      "working database": "iroha_data",
+      "maintenance database": "postgres"
+    }
     "max_proposal_size": 10,
     "proposal_delay": 5000,
     "vote_delay": 5000,
@@ -34,14 +46,41 @@ Deployment-specific parameters
   transactions are sent here.
 - ``internal_port`` sets the port for internal communications: ordering
   service, consensus and block loader.
-- ``pg_opt`` is used for setting credentials of PostgreSQL: hostname, port,
-  username, password and database name.
+- ``database`` (optional) is used to set the database configuration (see below)
+- ``pg_opt`` (optional) is a deprecated way of setting credentials of PostgreSQL:
+  hostname, port, username, password and database name.
   All data except the database name are mandatory.
-  If database name is not provided, a default one gets used.
+  If database name is not provided, the default one gets used, which is ``iroha_default``.
 - ``log`` is an optional parameter controlling log output verbosity and format
   (see below).
 
-.. warning:: Unspecified database name support is deprecated and will be removed!
+There is also an optional ``torii_tls_params`` parameter, which could be included
+in the config to enable TLS support for client communication.
+
+There, ``port`` is the TCP port where the TLS server will be bound, and
+``key_pair_path`` is the path to the keypair in a format such that appending
+``.crt`` to it would be the path to the PEM-encoded certificate, and appending
+``.key`` would be the path to the PEM-encoded private key for this certificate
+(e.g. if ``key_pair_path`` is ``"/path/to/the/keypair"`` iroha would look for
+certificate located at ``"/path/to/the/keypair.crt"`` and key located at
+``"/path/to/the/keypair.key"``)
+
+.. warning::
+   Configuration field ``pg_opt`` is deprecated, please use ``database`` section!
+
+   The ``database`` section overrides ``pg_opt`` when both are provided in configuration.
+
+   Both ``pg_opt`` and ``database`` fields are optional, but at least one must be specified.
+
+The ``database`` section fields:
+
+- ``host`` the host to use for PostgreSQL connection
+- ``port`` the port to use for PostgreSQL connection
+- ``user`` the user to use for PostgreSQL connection
+- ``password`` the password to use for PostgreSQL connection
+- ``working database`` is the name of database that will be used to store the world state view and optionally blocks.
+- ``maintenance database`` is the name of databse that will be used to maintain the working database.
+  For example, when iroha needs to create or drop its working database, it must use another database to connect to PostgreSQL.
 
 Environment-specific parameters
 -------------------------------

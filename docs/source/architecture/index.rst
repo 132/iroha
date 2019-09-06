@@ -1,10 +1,7 @@
 .. _architecture: 
-
+************
 Architecture
-============
-
-.. toctree::
-   :maxdepth: 2
+************
 
 HL Iroha network consists of several essential components that provide the communication between the nodes. You can learn about them below.
 

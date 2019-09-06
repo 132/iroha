@@ -16,8 +16,8 @@ namespace integration_framework {
    */
   class TestIrohad : public Irohad {
    public:
-    TestIrohad(const std::string &block_store_dir,
-               const std::string &pg_conn,
+    TestIrohad(const boost::optional<std::string> &block_store_dir,
+               std::unique_ptr<iroha::ametsuchi::PostgresOptions> pg_opt,
                const std::string &listen_ip,
                size_t torii_port,
                size_t internal_port,
@@ -33,9 +33,11 @@ namespace integration_framework {
                logger::LoggerManagerTreePtr irohad_log_manager,
                logger::LoggerPtr log,
                const boost::optional<iroha::GossipPropagationStrategyParams>
-                   &opt_mst_gossip_params = boost::none)
+                   &opt_mst_gossip_params = boost::none,
+               const boost::optional<iroha::torii::TlsParams>
+                   &torii_tls_params = boost::none)
         : Irohad(block_store_dir,
-                 pg_conn,
+                 std::move(pg_opt),
                  listen_ip,
                  torii_port,
                  internal_port,
@@ -48,7 +50,8 @@ namespace integration_framework {
                  stale_stream_max_rounds,
                  std::move(opt_alternative_peers),
                  std::move(irohad_log_manager),
-                 opt_mst_gossip_params),
+                 opt_mst_gossip_params,
+                 torii_tls_params),
           log_(std::move(log)) {}
 
     auto &getCommandService() {

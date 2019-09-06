@@ -12,7 +12,6 @@
 #include "ametsuchi/impl/wsv_restorer_impl.hpp"
 #include "ametsuchi/mutable_storage.hpp"
 #include "ametsuchi/temporary_wsv.hpp"
-#include "builders/default_builders.hpp"
 #include "builders/protobuf/transaction.hpp"
 #include "framework/result_fixture.hpp"
 #include "framework/test_logger.hpp"
@@ -74,24 +73,6 @@ void validateAccount(W &&wsv,
   ASSERT_TRUE(account);
   ASSERT_EQ((*account)->accountId(), id);
   ASSERT_EQ((*account)->domainId(), domain);
-}
-
-/**
- * Apply block to given storage
- * @tparam S storage type
- * @param storage storage object
- * @param block to apply
- */
-template <typename S>
-void apply(S &&storage,
-           std::shared_ptr<const shared_model::interface::Block> block) {
-  std::unique_ptr<MutableStorage> ms;
-  auto storageResult = storage->createMutableStorage();
-  storageResult.match(
-      [&](auto &&_storage) { ms = std::move(_storage.value); },
-      [](const auto &error) { FAIL() << "MutableStorage: " << error.error; });
-  ASSERT_TRUE(ms->apply(block));
-  ASSERT_TRUE(val(storage->commit(std::move(ms))));
 }
 
 TEST_F(AmetsuchiTest, GetBlocksCompletedWhenCalled) {
@@ -403,13 +384,7 @@ TEST_F(AmetsuchiTest, TestingStorageWhenCommitBlock) {
     ASSERT_EQ(block, expected_block);
   });
 
-  std::unique_ptr<MutableStorage> mutable_storage;
-  storage->createMutableStorage().match(
-      [&mutable_storage](auto &&mut_storage) {
-        mutable_storage = std::move(mut_storage.value);
-      },
-      [](const auto &) { FAIL() << "Mutable storage cannot be created"; });
-
+  auto mutable_storage = createMutableStorage();
   mutable_storage->apply(expected_block);
 
   ASSERT_TRUE(val(storage->commit(std::move(mutable_storage))));
@@ -577,7 +552,8 @@ class PreparedBlockTest : public AmetsuchiTest {
     genesis_block = createBlock({*genesis_tx});
     initial_tx = clone(createAddAsset("5.00"));
     apply(storage, genesis_block);
-    temp_wsv = std::move(val(storage->createTemporaryWsv())->value);
+    command_executor = std::move(val(storage->createCommandExecutor())->value);
+    temp_wsv = storage->createTemporaryWsv(command_executor);
   }
 
   shared_model::crypto::Keypair key;
@@ -586,6 +562,7 @@ class PreparedBlockTest : public AmetsuchiTest {
   std::unique_ptr<shared_model::proto::Transaction> genesis_tx;
   std::unique_ptr<shared_model::proto::Transaction> initial_tx;
   std::shared_ptr<const shared_model::interface::Block> genesis_block;
+  std::shared_ptr<iroha::ametsuchi::CommandExecutor> command_executor;
   std::unique_ptr<iroha::ametsuchi::TemporaryWsv> temp_wsv;
   shared_model::interface::Amount base_balance{"5.00"};
 };
@@ -693,7 +670,7 @@ TEST_F(PreparedBlockTest, TemporaryWsvUnlocks) {
   ASSERT_TRUE(val(result));
   storage->prepareBlock(std::move(temp_wsv));
 
-  temp_wsv = std::move(val(storage->createTemporaryWsv())->value);
+  temp_wsv = storage->createTemporaryWsv(command_executor);
 
   result = temp_wsv->apply(*initial_tx);
   ASSERT_TRUE(val(result));

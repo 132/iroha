@@ -155,17 +155,16 @@ namespace iroha {
 
       void SetUp() override {
         AmetsuchiTest::SetUp();
-        sql = std::make_unique<soci::session>(*soci::factory_postgresql(),
-                                              pgopt_);
 
         auto factory =
             std::make_shared<shared_model::proto::ProtoCommonObjectsFactory<
                 shared_model::validation::FieldValidator>>(
                 iroha::test::kTestsValidatorsConfig);
         query_executor = storage;
-        PostgresCommandExecutor::prepareStatements(*sql);
-        executor =
-            std::make_unique<PostgresCommandExecutor>(*sql, perm_converter);
+        executor = std::make_unique<PostgresCommandExecutor>(
+            std::make_unique<soci::session>(*soci::factory_postgresql(),
+                                            pgopt_),
+            perm_converter);
         pending_txs_storage = std::make_shared<MockPendingTransactionStorage>();
 
         execute(
@@ -187,7 +186,6 @@ namespace iroha {
       }
 
       void TearDown() override {
-        sql->close();
         AmetsuchiTest::TearDown();
       }
 
@@ -204,10 +202,11 @@ namespace iroha {
                    bool do_validation = false,
                    const shared_model::interface::types::AccountIdType
                        &creator = "id@domain") {
-        executor->doValidation(not do_validation);
-        executor->setCreatorAccountId(creator);
-        ASSERT_TRUE(
-            val(executor->operator()(std::forward<CommandType>(command))));
+        shared_model::interface::Command::CommandVariantType variant{
+            std::forward<CommandType>(command)};
+        shared_model::interface::MockCommand cmd;
+        EXPECT_CALL(cmd, get()).WillRepeatedly(::testing::ReturnRef(variant));
+        ASSERT_TRUE(val(executor->execute(cmd, creator, not do_validation)));
       }
 
       void addPerms(
@@ -220,12 +219,40 @@ namespace iroha {
                 true);
       }
 
+      void addAllPermsWithoutRoot(
+          const shared_model::interface::types::AccountIdType account_id =
+              "id@domain",
+          const shared_model::interface::types::RoleIdType role_id = "all") {
+        shared_model::interface::RolePermissionSet permissions;
+        permissions.setAll();
+        permissions.unset(shared_model::interface::permissions::Role::kRoot);
+
+        execute(
+            *mock_command_factory->constructCreateRole(role_id, permissions),
+            true);
+        execute(*mock_command_factory->constructAppendRole(account_id, role_id),
+                true);
+      }
+
       void addAllPerms(
           const shared_model::interface::types::AccountIdType account_id =
               "id@domain",
           const shared_model::interface::types::RoleIdType role_id = "all") {
         shared_model::interface::RolePermissionSet permissions;
         permissions.setAll();
+        execute(
+            *mock_command_factory->constructCreateRole(role_id, permissions),
+            true);
+        execute(*mock_command_factory->constructAppendRole(account_id, role_id),
+                true);
+      }
+
+      void removeAllPerms(
+          const shared_model::interface::types::AccountIdType account_id =
+              "id@domain",
+          const shared_model::interface::types::RoleIdType role_id = "none") {
+        shared_model::interface::RolePermissionSet permissions;
+        permissions.unsetAll();
         execute(
             *mock_command_factory->constructCreateRole(role_id, permissions),
             true);
@@ -267,15 +294,13 @@ namespace iroha {
       std::unique_ptr<shared_model::interface::types::PubkeyType> pubkey;
       std::unique_ptr<shared_model::interface::types::PubkeyType> pubkey2;
 
-      std::unique_ptr<soci::session> sql;
-
       std::unique_ptr<shared_model::interface::Command> command;
 
       std::shared_ptr<QueryExecutorFactory> query_executor;
       std::unique_ptr<CommandExecutor> executor;
       std::shared_ptr<MockPendingTransactionStorage> pending_txs_storage;
 
-      std::unique_ptr<KeyValueStorage> block_store;
+      std::unique_ptr<BlockStorage> block_store;
 
       std::shared_ptr<shared_model::interface::QueryResponseFactory>
           query_response_factory;
@@ -299,7 +324,7 @@ namespace iroha {
      * @then result is successful
      */
     TEST_F(BlocksQueryExecutorTest, BlocksQueryExecutorTestValid) {
-      addAllPerms();
+      addAllPermsWithoutRoot();
       auto blocks_query =
           TestBlocksQueryBuilder().creatorAccountId(account_id).build();
       ASSERT_TRUE(query_executor->createQueryExecutor(pending_txs_storage,
@@ -322,6 +347,22 @@ namespace iroha {
                    | [&blocks_query](const auto &executor) {
                        return executor->validate(blocks_query, false);
                      });
+    }
+
+    /**
+     * @given root permissions
+     * @when get blocks query is validated
+     * @then result is successful
+     */
+    TEST_F(BlocksQueryExecutorTest, BlocksQueryExecutorTestValidWithRoot) {
+      addPerms({shared_model::interface::permissions::Role::kRoot});
+      auto blocks_query =
+          TestBlocksQueryBuilder().creatorAccountId(account_id).build();
+      ASSERT_TRUE(query_executor->createQueryExecutor(pending_txs_storage,
+                                                      query_response_factory)
+                  | [&blocks_query](const auto &executor) {
+                      return executor->validate(blocks_query, false);
+                    });
     }
 
     class GetAccountExecutorTest : public QueryExecutorTest {
@@ -420,6 +461,60 @@ namespace iroha {
           std::move(result), kNoStatefulError);
     }
 
+    /**
+     * @given initialized storage, root permission
+     * @when get account information
+     * @then Return account
+     */
+    TEST_F(GetAccountExecutorTest, ValidMyAccountWithRoot) {
+      addPerms({shared_model::interface::permissions::Role::kRoot});
+      auto query = TestQueryBuilder()
+                       .creatorAccountId(account_id)
+                       .getAccount(account_id)
+                       .build();
+      auto result = executeQuery(query);
+      checkSuccessfulResult<shared_model::interface::AccountResponse>(
+          std::move(result), [](const auto &cast_resp) {
+            ASSERT_EQ(cast_resp.account().accountId(), account_id);
+          });
+    }
+
+    /**
+     * @given initialized storage, root permission
+     * @when get account information about other user
+     * @then Return account
+     */
+    TEST_F(GetAccountExecutorTest, ValidAllAccountsWithRoot) {
+      addPerms({shared_model::interface::permissions::Role::kRoot});
+      auto query = TestQueryBuilder()
+                       .creatorAccountId(account_id)
+                       .getAccount(another_account_id)
+                       .build();
+      auto result = executeQuery(query);
+      checkSuccessfulResult<shared_model::interface::AccountResponse>(
+          std::move(result), [](const auto &cast_resp) {
+            ASSERT_EQ(cast_resp.account().accountId(), another_account_id);
+          });
+    }
+
+    /**
+     * @given initialized storage, root permission
+     * @when get account information about other user in the same domain
+     * @then Return account
+     */
+    TEST_F(GetAccountExecutorTest, ValidDomainAccountWithRoot) {
+      addPerms({shared_model::interface::permissions::Role::kRoot});
+      auto query = TestQueryBuilder()
+                       .creatorAccountId(account_id)
+                       .getAccount(account_id2)
+                       .build();
+      auto result = executeQuery(query);
+      checkSuccessfulResult<shared_model::interface::AccountResponse>(
+          std::move(result), [](const auto &cast_resp) {
+            ASSERT_EQ(cast_resp.account().accountId(), account_id2);
+          });
+    }
+
     class GetSignatoriesExecutorTest : public QueryExecutorTest {
      public:
       void SetUp() override {
@@ -515,310 +610,55 @@ namespace iroha {
           std::move(result), kNoStatefulError);
     }
 
-    class GetAccountAssetExecutorTest : public QueryExecutorTest {
-     public:
-      void SetUp() override {
-        QueryExecutorTest::SetUp();
-
-        createDefaultAccount();
-        createDefaultAsset();
-
-        execute(*mock_command_factory->constructAddAssetQuantity(
-                    asset_id, shared_model::interface::Amount{"1.0"}),
-                true);
-        execute(*mock_command_factory->constructAddAssetQuantity(
-                    asset_id, shared_model::interface::Amount{"1.0"}),
-                true,
-                account_id2);
-      }
-    };
-
     /**
-     * @given initialized storage, permission to his/her account
-     * @when get account assets
-     * @then Return account asset of user
+     * @given initialized storage, root permission
+     * @when get signatories
+     * @then Return signatories of user
      */
-    TEST_F(GetAccountAssetExecutorTest, ValidMyAccount) {
-      addPerms({shared_model::interface::permissions::Role::kGetMyAccAst});
+    TEST_F(GetSignatoriesExecutorTest, ValidMyAccountWithRoot) {
+      addPerms({shared_model::interface::permissions::Role::kRoot});
       auto query = TestQueryBuilder()
                        .creatorAccountId(account_id)
-                       .getAccountAssets(account_id, kMaxPageSize, boost::none)
+                       .getSignatories(account_id)
                        .build();
       auto result = executeQuery(query);
-      checkSuccessfulResult<shared_model::interface::AccountAssetResponse>(
-          std::move(result), [](const auto &cast_resp) {
-            ASSERT_EQ(cast_resp.accountAssets()[0].accountId(), account_id);
-            ASSERT_EQ(cast_resp.accountAssets()[0].assetId(), asset_id);
-          });
+      checkSuccessfulResult<shared_model::interface::SignatoriesResponse>(
+          std::move(result),
+          [](const auto &cast_resp) { ASSERT_EQ(cast_resp.keys().size(), 1); });
     }
 
     /**
-     * @given initialized storage, global permission
-     * @when get account assets of other user
-     * @then Return account asset
+     * @given initialized storage, root permission
+     * @when get signatories of other user
+     * @then Return signatories
      */
-    TEST_F(GetAccountAssetExecutorTest, ValidAllAccounts) {
-      addPerms({shared_model::interface::permissions::Role::kGetAllAccAst});
+    TEST_F(GetSignatoriesExecutorTest, ValidAllAccountsWithRoot) {
+      addPerms({shared_model::interface::permissions::Role::kRoot});
       auto query = TestQueryBuilder()
                        .creatorAccountId(account_id)
-                       .getAccountAssets(account_id2, kMaxPageSize, boost::none)
+                       .getSignatories(another_account_id)
                        .build();
       auto result = executeQuery(query);
-      checkSuccessfulResult<shared_model::interface::AccountAssetResponse>(
-          std::move(result), [](const auto &cast_resp) {
-            ASSERT_EQ(cast_resp.accountAssets()[0].accountId(), account_id2);
-            ASSERT_EQ(cast_resp.accountAssets()[0].assetId(), asset_id);
-          });
+      checkSuccessfulResult<shared_model::interface::SignatoriesResponse>(
+          std::move(result),
+          [](const auto &cast_resp) { ASSERT_EQ(cast_resp.keys().size(), 1); });
     }
 
     /**
      * @given initialized storage, domain permission
-     * @when get account assets of other user in the same domain
-     * @then Return account asset
+     * @when get signatories of other user in the same domain
+     * @then Return signatories
      */
-    TEST_F(GetAccountAssetExecutorTest, ValidDomainAccount) {
-      addPerms({shared_model::interface::permissions::Role::kGetDomainAccAst});
+    TEST_F(GetSignatoriesExecutorTest, ValidDomainAccountWithRoot) {
+      addPerms({shared_model::interface::permissions::Role::kRoot});
       auto query = TestQueryBuilder()
                        .creatorAccountId(account_id)
-                       .getAccountAssets(account_id2, kMaxPageSize, boost::none)
+                       .getSignatories(account_id2)
                        .build();
       auto result = executeQuery(query);
-      checkSuccessfulResult<shared_model::interface::AccountAssetResponse>(
-          std::move(result), [](const auto &cast_resp) {
-            ASSERT_EQ(cast_resp.accountAssets()[0].accountId(), account_id2);
-            ASSERT_EQ(cast_resp.accountAssets()[0].assetId(), asset_id);
-          });
-    }
-
-    /**
-     * @given initialized storage, domain permission
-     * @when get account assets of other user in the other domain
-     * @then Return error
-     */
-    TEST_F(GetAccountAssetExecutorTest, InvalidDifferentDomain) {
-      addPerms({shared_model::interface::permissions::Role::kGetDomainAccAst});
-      auto query =
-          TestQueryBuilder()
-              .creatorAccountId(account_id)
-              .getAccountAssets(another_account_id, kMaxPageSize, boost::none)
-              .build();
-      auto result = executeQuery(query);
-      checkStatefulError<shared_model::interface::StatefulFailedErrorResponse>(
-          std::move(result), kNoPermissions);
-    }
-
-    /**
-     * @given initialized storage, permission
-     * @when get account assets of non existing account
-     * @then Return error
-     */
-    TEST_F(GetAccountAssetExecutorTest, DISABLED_InvalidNoAccount) {
-      addPerms({shared_model::interface::permissions::Role::kGetAllAccAst});
-      auto query =
-          TestQueryBuilder()
-              .creatorAccountId(account_id)
-              .getAccountAssets("some@domain", kMaxPageSize, boost::none)
-              .build();
-      auto result = executeQuery(query);
-      checkStatefulError<shared_model::interface::NoAccountAssetsErrorResponse>(
-          std::move(result), kNoStatefulError);
-    }
-
-    class GetAccountAssetPaginationExecutorTest : public QueryExecutorTest {
-     public:
-      void SetUp() override {
-        QueryExecutorTest::SetUp();
-        using shared_model::interface::permissions::Role;
-        addPerms({Role::kGetMyAccAst, Role::kAddAssetQty, Role::kCreateAsset});
-      }
-
-      std::string makeAssetName(size_t i) {
-        return (boost::format("asset_%03d") % i).str();
-      }
-
-      shared_model::interface::types::AssetIdType makeAssetId(size_t i) {
-        return makeAssetName(i) + "#" + domain_id;
-      }
-
-      shared_model::interface::Amount makeAssetQuantity(size_t n) {
-        return shared_model::interface::Amount{
-            (boost::format("%d.0") % n).str()};
-      }
-
-      /**
-       * Create new assets and add some quantity to the default account.
-       * Asset names are `asset_NNN`, where NNN is zero-padded number in the
-       * order of creation. Asset precision is 1. The quantity added equals the
-       * asset number.
-       */
-      void createAccountAssets(size_t n) {
-        for (size_t i = 0; i < n; ++i) {
-          // create the asset
-          execute(*mock_command_factory->constructCreateAsset(
-                      makeAssetName(assets_added_), domain_id, 1),
-                  true);
-
-          // add asset quantity to default account
-          execute(
-              *mock_command_factory->constructAddAssetQuantity(
-                  makeAssetId(assets_added_), makeAssetQuantity(assets_added_)),
-              true);
-
-          ++assets_added_;
-        }
-      }
-
-      /**
-       * Check the page response.
-       * @param response the response of GetAccountAssets query
-       * @param page_start requested first asset (according to the order of
-       *        addition)
-       * @param page_size requested page size
-       */
-      void validatePageResponse(const QueryExecutorResult &response,
-                                boost::optional<size_t> page_start,
-                                size_t page_size) {
-        checkSuccessfulResult<shared_model::interface::AccountAssetResponse>(
-            response,
-            [this, page_start = page_start.value_or(0), page_size](
-                const auto &response) {
-              ASSERT_LE(page_start, assets_added_) << "Bad test.";
-              const bool is_last_page = page_start + page_size >= assets_added_;
-              const size_t expected_page_size =
-                  is_last_page ? assets_added_ - page_start : page_size;
-              EXPECT_EQ(response.accountAssets().size(), expected_page_size);
-              EXPECT_EQ(response.totalAccountAssetsNumber(), assets_added_);
-              if (is_last_page) {
-                EXPECT_FALSE(response.nextAssetId());
-              } else {
-                if (not response.nextAssetId()) {
-                  ADD_FAILURE() << "nextAssetId not set!";
-                } else {
-                  EXPECT_EQ(*response.nextAssetId(),
-                            this->makeAssetId(page_start + page_size));
-                }
-              }
-              for (size_t i = 0; i < response.accountAssets().size(); ++i) {
-                EXPECT_EQ(response.accountAssets()[i].assetId(),
-                          this->makeAssetId(page_start + i));
-                EXPECT_EQ(response.accountAssets()[i].balance(),
-                          this->makeAssetQuantity(page_start + i));
-                EXPECT_EQ(response.accountAssets()[i].accountId(), account_id);
-              }
-            });
-      }
-
-      /**
-       * Query account assets.
-       */
-      QueryExecutorResult queryPage(boost::optional<size_t> page_start,
-                                    size_t page_size) {
-        boost::optional<shared_model::interface::types::AssetIdType>
-            first_asset_id;
-        if (page_start) {
-          first_asset_id = makeAssetId(page_start.value());
-        }
-        auto query =
-            TestQueryBuilder()
-                .creatorAccountId(account_id)
-                .getAccountAssets(account_id, page_size, first_asset_id)
-                .build();
-        return executeQuery(query);
-      }
-
-      /**
-       * Query account assets and validate the response.
-       */
-      QueryExecutorResult queryPageAndValidateResponse(
-          boost::optional<size_t> page_start, size_t page_size) {
-        auto response = queryPage(page_start, page_size);
-        validatePageResponse(response, page_start, page_size);
-        return response;
-      }
-
-      /// The number of assets added to the default account.
-      size_t assets_added_{0};
-    };
-
-    /**
-     * @given account with all related permissions and 10 assets
-     * @when queried assets with page metadata not set
-     * @then all 10 asset values are returned and are valid
-     */
-    TEST_F(GetAccountAssetPaginationExecutorTest, NoPageMetaData) {
-      createAccountAssets(10);
-
-      shared_model::proto::Query query{[] {
-        iroha::protocol::Query query;
-
-        // set creator account
-        query.mutable_payload()->mutable_meta()->set_creator_account_id(
-            account_id);
-
-        // make a getAccountAssets query
-        query.mutable_payload()->mutable_get_account_assets()->set_account_id(
-            account_id);
-
-        return shared_model::proto::Query{query};
-      }()};
-
-      // send the query
-      QueryExecutorResult response = executeQuery(query);
-
-      // validate result
-      validatePageResponse(response, boost::none, 10);
-    }
-
-    /**
-     * @given account with all related permissions and 10 assets
-     * @when queried assets first page of size 5
-     * @then first 5 asset values are returned and are valid
-     */
-    TEST_F(GetAccountAssetPaginationExecutorTest, FirstPage) {
-      createAccountAssets(10);
-      queryPageAndValidateResponse(boost::none, 5);
-    }
-
-    /**
-     * @given account with all related permissions and 10 assets
-     * @when queried assets page of size 5 starting from 3rd asset
-     * @then assets' #3 to #7 values are returned and are valid
-     */
-    TEST_F(GetAccountAssetPaginationExecutorTest, MiddlePage) {
-      createAccountAssets(10);
-      queryPageAndValidateResponse(3, 5);
-    }
-
-    /**
-     * @given account with all related permissions and 10 assets
-     * @when queried assets page of size 5 starting from 5th asset
-     * @then assets' #5 to #9 values are returned and are valid
-     */
-    TEST_F(GetAccountAssetPaginationExecutorTest, LastPage) {
-      createAccountAssets(10);
-      queryPageAndValidateResponse(5, 5);
-    }
-
-    /**
-     * @given account with all related permissions and 10 assets
-     * @when queried assets page of size 5 starting from 8th asset
-     * @then assets' #8 to #9 values are returned and are valid
-     */
-    TEST_F(GetAccountAssetPaginationExecutorTest, PastLastPage) {
-      createAccountAssets(10);
-      queryPageAndValidateResponse(8, 5);
-    }
-
-    /**
-     * @given account with all related permissions and 10 assets
-     * @when queried assets page of size 5 starting from unknown asset
-     * @then error response is returned
-     */
-    TEST_F(GetAccountAssetPaginationExecutorTest, NonexistentStartTx) {
-      createAccountAssets(10);
-      auto response = queryPage(10, 5);
-      checkStatefulError<shared_model::interface::StatefulFailedErrorResponse>(
-          response, kInvalidPagination);
+      checkSuccessfulResult<shared_model::interface::SignatoriesResponse>(
+          std::move(result),
+          [](const auto &cast_resp) { ASSERT_EQ(cast_resp.keys().size(), 1); });
     }
 
     class GetAccountDetailExecutorTest : public QueryExecutorTest {
@@ -1008,6 +848,59 @@ namespace iroha {
           });
     }
 
+    /**
+     * @given initialized storage, root permission
+     * @when get account detail
+     * @then Return account detail
+     */
+    TEST_F(GetAccountDetailExecutorTest, ValidMyAccountWithRoot) {
+      addPerms({shared_model::interface::permissions::Role::kRoot});
+      auto query = TestQueryBuilder()
+                       .creatorAccountId(account_id)
+                       .getAccountDetail(kMaxPageSize, account_id)
+                       .build();
+      auto result = executeQuery(query);
+      checkSuccessfulResult<shared_model::interface::AccountDetailResponse>(
+          std::move(result),
+          [](const auto &cast_resp) { ASSERT_EQ(cast_resp.detail(), "{}"); });
+    }
+
+    /**
+     * @given initialized storage, root permission
+     * @when get account detail of other user
+     * @then Return account detail
+     */
+    TEST_F(GetAccountDetailExecutorTest, ValidAllAccountsWithRoot) {
+      addPerms({shared_model::interface::permissions::Role::kRoot});
+      auto query = TestQueryBuilder()
+                       .creatorAccountId(account_id)
+                       .getAccountDetail(kMaxPageSize, account_id2)
+                       .build();
+      auto result = executeQuery(query);
+      checkSuccessfulResult<shared_model::interface::AccountDetailResponse>(
+          std::move(result), [this](const auto &cast_resp) {
+            ASSERT_EQ(cast_resp.detail(), detail);
+          });
+    }
+
+    /**
+     * @given initialized storage, root permission
+     * @when get account detail of other user in the same domain
+     * @then Return account detail
+     */
+    TEST_F(GetAccountDetailExecutorTest, ValidDomainAccountWithRoot) {
+      addPerms({shared_model::interface::permissions::Role::kRoot});
+      auto query = TestQueryBuilder()
+                       .creatorAccountId(account_id)
+                       .getAccountDetail(kMaxPageSize, account_id2)
+                       .build();
+      auto result = executeQuery(query);
+      checkSuccessfulResult<shared_model::interface::AccountDetailResponse>(
+          std::move(result), [this](const auto &cast_resp) {
+            ASSERT_EQ(cast_resp.detail(), detail);
+          });
+    }
+
     // --------| GetAccountDetail - pagination tests |------------------>8 -----
 
     class GetAccountDetailPagedExecutorTest : public QueryExecutorTest {
@@ -1075,7 +968,8 @@ namespace iroha {
       QueryExecutorResult queryPage(
           boost::optional<std::string> writer,
           boost::optional<std::string> key,
-          boost::optional<types::AccountDetailRecordId> first_record_id,
+          boost::optional<shared_model::plain::AccountDetailRecordId>
+              first_record_id,
           size_t page_size) {
         auto query = TestQueryBuilder()
                          .creatorAccountId(account_id)
@@ -1100,7 +994,8 @@ namespace iroha {
           const QueryExecutorResult &response,
           boost::optional<std::string> writer,
           boost::optional<std::string> key,
-          boost::optional<types::AccountDetailRecordId> first_record_id,
+          boost::optional<shared_model::plain::AccountDetailRecordId>
+              first_record_id,
           size_t page_size) {
         checkSuccessfulResult<shared_model::interface::AccountDetailResponse>(
             response, [&, this](const auto &response) {
@@ -1113,7 +1008,7 @@ namespace iroha {
      protected:
       struct Response {
         size_t total_number{0};
-        boost::optional<types::AccountDetailRecordId> next_record;
+        boost::optional<shared_model::plain::AccountDetailRecordId> next_record;
         DetailsByKeyByWriter details;
       };
 
@@ -1124,7 +1019,8 @@ namespace iroha {
       Response getExpectedResponse(
           const boost::optional<std::string> &req_writer,
           const boost::optional<std::string> &req_key,
-          const boost::optional<types::AccountDetailRecordId> &first_record_id,
+          const boost::optional<shared_model::plain::AccountDetailRecordId>
+              &first_record_id,
           size_t page_size) {
         auto optional_match = [](const auto &opt, const auto &val) {
           return not opt or opt.value() == val;
@@ -1150,12 +1046,14 @@ namespace iroha {
                 page_started = page_started
                     or optional_match(
                                    first_record_id,
-                                   types::AccountDetailRecordId{writer, key});
+                                   shared_model::plain::AccountDetailRecordId{
+                                       writer, key});
                 if (page_started) {
                   if (page_ended) {
                     if (not expected_response.next_record) {
                       expected_response.next_record =
-                          types::AccountDetailRecordId{writer, key};
+                          shared_model::plain::AccountDetailRecordId{writer,
+                                                                     key};
                     }
                   } else {
                     expected_response.details[writer][key] = val;
@@ -1182,9 +1080,9 @@ namespace iroha {
             ADD_FAILURE() << "nextRecordId not set!";
           } else {
             EXPECT_EQ(response.nextRecordId()->writer(),
-                      expected_response.next_record->writer);
+                      expected_response.next_record->writer());
             EXPECT_EQ(response.nextRecordId()->key(),
-                      expected_response.next_record->key);
+                      expected_response.next_record->key());
           }
         } else {
           EXPECT_FALSE(response.nextRecordId());
@@ -1309,7 +1207,8 @@ namespace iroha {
       checkStatefulError<shared_model::interface::StatefulFailedErrorResponse>(
           queryPage(boost::none,
                     boost::none,
-                    types::AccountDetailRecordId{makeAccountId(2), makeKey(2)},
+                    shared_model::plain::AccountDetailRecordId{makeAccountId(2),
+                                                               makeKey(2)},
                     2),
           kInvalidPagination);
     }
@@ -1348,15 +1247,16 @@ namespace iroha {
         return boost::none;
       }
 
-      types::AccountDetailRecordId makeFirstRecordId(std::string writer,
-                                                     std::string key) {
-        return types::AccountDetailRecordId{
+      shared_model::plain::AccountDetailRecordId makeFirstRecordId(
+          std::string writer, std::string key) {
+        return shared_model::plain::AccountDetailRecordId{
             requestedWriter().value_or(std::move(writer)),
             requestedKey().value_or(std::move(key))};
       }
 
       QueryExecutorResult queryPage(
-          boost::optional<types::AccountDetailRecordId> first_record_id,
+          boost::optional<shared_model::plain::AccountDetailRecordId>
+              first_record_id,
           size_t page_size) {
         return GetAccountDetailPagedExecutorTest::queryPage(
             requestedWriter(),
@@ -1372,7 +1272,8 @@ namespace iroha {
 
       void validatePageResponse(
           const QueryExecutorResult &response,
-          boost::optional<types::AccountDetailRecordId> first_record_id,
+          boost::optional<shared_model::plain::AccountDetailRecordId>
+              first_record_id,
           size_t page_size) {
         checkSuccessfulResult<shared_model::interface::AccountDetailResponse>(
             response, [&, this](const auto &response) {
@@ -1473,12 +1374,7 @@ namespace iroha {
        */
       void commitBlocks(shared_model::interface::types::HeightType
                             number_of_blocks = kLedgerHeight) {
-        std::unique_ptr<MutableStorage> ms;
-        storage->createMutableStorage().match(
-            [&ms](auto &&storage) { ms = std::move(storage.value); },
-            [](const auto &error) {
-              FAIL() << "MutableStorage: " << error.error;
-            });
+        auto ms = createMutableStorage();
 
         auto prev_hash = shared_model::crypto::Hash(zero_string);
         for (decltype(number_of_blocks) i = 1; i < number_of_blocks; ++i) {
@@ -1559,6 +1455,27 @@ namespace iroha {
           std::move(result), kNoPermissions);
     }
 
+    /**
+     * @given initialized storage @and root permission
+     * @when get block of valid height
+     * @then return block
+     */
+    TEST_F(GetBlockExecutorTest, ValidWithRoot) {
+      const shared_model::interface::types::HeightType valid_height = 2;
+
+      addPerms({shared_model::interface::permissions::Role::kRoot});
+      commitBlocks();
+      auto query = TestQueryBuilder()
+                       .creatorAccountId(account_id)
+                       .getBlock(valid_height)
+                       .build();
+      auto result = executeQuery(query);
+      checkSuccessfulResult<shared_model::interface::BlockResponse>(
+          std::move(result), [valid_height](const auto &cast_resp) {
+            ASSERT_EQ(cast_resp.block().height(), valid_height);
+          });
+    }
+
     class GetRolesExecutorTest : public QueryExecutorTest {
      public:
       void SetUp() override {
@@ -1595,6 +1512,24 @@ namespace iroha {
       auto result = executeQuery(query);
       checkStatefulError<shared_model::interface::StatefulFailedErrorResponse>(
           std::move(result), kNoPermissions);
+    }
+
+    /**
+     * @given initialized storage, root permission
+     * @when get system roles
+     * @then Return roles
+     */
+    TEST_F(GetRolesExecutorTest, ValidWithRoot) {
+      addPerms({shared_model::interface::permissions::Role::kRoot});
+      auto query =
+          TestQueryBuilder().creatorAccountId(account_id).getRoles().build();
+      auto result = executeQuery(query);
+      checkSuccessfulResult<shared_model::interface::RolesResponse>(
+          std::move(result), [](const auto &cast_resp) {
+            ASSERT_EQ(cast_resp.roles().size(), 2);
+            ASSERT_EQ(cast_resp.roles()[0], "role");
+            ASSERT_EQ(cast_resp.roles()[1], "perms");
+          });
     }
 
     class GetRolePermsExecutorTest : public QueryExecutorTest {
@@ -1653,6 +1588,25 @@ namespace iroha {
       auto result = executeQuery(query);
       checkStatefulError<shared_model::interface::StatefulFailedErrorResponse>(
           std::move(result), kNoPermissions);
+    }
+
+    /**
+     * @given initialized storage, root permission
+     * @when get role permissions
+     * @then Return role permissions
+     */
+    TEST_F(GetRolePermsExecutorTest, ValidWithRoot) {
+      addPerms({shared_model::interface::permissions::Role::kRoot});
+      auto query = TestQueryBuilder()
+                       .creatorAccountId(account_id)
+                       .getRolePermissions("perms")
+                       .build();
+      auto result = executeQuery(query);
+      checkSuccessfulResult<shared_model::interface::RolePermissionsResponse>(
+          std::move(result), [](const auto &cast_resp) {
+            ASSERT_TRUE(cast_resp.rolePermissions().isSet(
+                shared_model::interface::permissions::Role::kRoot));
+          });
     }
 
     class GetAssetInfoExecutorTest : public QueryExecutorTest {
@@ -1721,42 +1675,38 @@ namespace iroha {
           std::move(result), kNoPermissions);
     }
 
+    /**
+     * @given initialized storage, root permission
+     * @when get asset info
+     * @then Return asset
+     */
+    TEST_F(GetAssetInfoExecutorTest, ValidWithRoot) {
+      addPerms({shared_model::interface::permissions::Role::kRoot});
+      createAsset();
+      auto query = TestQueryBuilder()
+                       .creatorAccountId(account_id)
+                       .getAssetInfo(asset_id)
+                       .build();
+      auto result = executeQuery(query);
+      checkSuccessfulResult<shared_model::interface::AssetResponse>(
+          std::move(result), [this](const auto &cast_resp) {
+            ASSERT_EQ(cast_resp.asset().assetId(), asset_id);
+            ASSERT_EQ(cast_resp.asset().domainId(), domain_id);
+            ASSERT_EQ(cast_resp.asset().precision(), 1);
+          });
+    }
+
     class GetTransactionsExecutorTest : public QueryExecutorTest {
      public:
       void SetUp() override {
         QueryExecutorTest::SetUp();
-        std::string block_store_dir = "/tmp/block_store";
-        auto block_converter =
-            std::make_shared<shared_model::proto::ProtoBlockJsonConverter>();
-        auto factory =
-            std::make_shared<shared_model::proto::ProtoCommonObjectsFactory<
-                shared_model::validation::FieldValidator>>(
-                iroha::test::kTestsValidatorsConfig);
-        auto block_store =
-            FlatFile::create(block_store_dir, getTestLogger("FlatFile"));
+        auto block_storage_persistent_factory =
+            std::make_unique<InMemoryBlockStorageFactory>();
+        auto block_store = block_storage_persistent_factory->create();
         ASSERT_TRUE(block_store);
-        this->block_store = std::move(block_store.get());
+        this->block_store = std::move(block_store);
         createDefaultAccount();
         createDefaultAsset();
-      }
-
-      /**
-       * Apply block to given storage
-       * @tparam S storage type
-       * @param storage storage object
-       * @param block to apply
-       */
-      template <typename S>
-      void apply(S &&storage,
-                 std::shared_ptr<const shared_model::interface::Block> block) {
-        std::unique_ptr<MutableStorage> ms;
-        storage->createMutableStorage().match(
-            [&](auto &&_storage) { ms = std::move(_storage.value); },
-            [](const auto &error) {
-              FAIL() << "MutableStorage: " << error.error;
-            });
-        ms->apply(block);
-        ASSERT_TRUE(val(storage->commit(std::move(ms))));
       }
 
       void commitBlocks() {
@@ -2148,7 +2098,7 @@ namespace iroha {
      * @then return error
      */
     TEST_F(GetAccountTransactionsExecutorTest, InvalidNoAccount) {
-      addAllPerms();
+      addAllPermsWithoutRoot();
 
       auto query = TestQueryBuilder()
                        .creatorAccountId(account_id)
@@ -2157,6 +2107,81 @@ namespace iroha {
       auto result = executeQuery(query);
       checkStatefulError<shared_model::interface::StatefulFailedErrorResponse>(
           std::move(result), kInvalidAccountId);
+    }
+
+    /**
+     * @given initialized storage, root permission
+     * @when get account transactions
+     * @then Return account transactions of user
+     */
+    TEST_F(GetAccountTransactionsExecutorTest, ValidMyAccountWithRoot) {
+      addPerms({shared_model::interface::permissions::Role::kRoot});
+
+      commitBlocks();
+
+      auto query = TestQueryBuilder()
+                       .creatorAccountId(account_id)
+                       .getAccountTransactions(account_id, kTxPageSize)
+                       .build();
+      auto result = executeQuery(query);
+      checkSuccessfulResult<shared_model::interface::TransactionsPageResponse>(
+          std::move(result), [](const auto &cast_resp) {
+            ASSERT_EQ(cast_resp.transactions().size(), 3);
+            for (const auto &tx : cast_resp.transactions()) {
+              static size_t i = 0;
+              EXPECT_EQ(account_id, tx.creatorAccountId())
+                  << tx.toString() << " ~~ " << i;
+              ++i;
+            }
+          });
+    }
+
+    /**
+     * @given initialized storage, root permission
+     * @when get account transactions of other user
+     * @then Return account transactions
+     */
+    TEST_F(GetAccountTransactionsExecutorTest, ValidAllAccountsWithRoot) {
+      addPerms({shared_model::interface::permissions::Role::kRoot});
+
+      commitBlocks();
+
+      auto query = TestQueryBuilder()
+                       .creatorAccountId(account_id)
+                       .getAccountTransactions(account_id2, kTxPageSize)
+                       .build();
+      auto result = executeQuery(query);
+      checkSuccessfulResult<shared_model::interface::TransactionsPageResponse>(
+          std::move(result), [](const auto &cast_resp) {
+            ASSERT_EQ(cast_resp.transactions().size(), 2);
+            for (const auto &tx : cast_resp.transactions()) {
+              EXPECT_EQ(account_id2, tx.creatorAccountId()) << tx.toString();
+            }
+          });
+    }
+
+    /**
+     * @given initialized storage, root permission
+     * @when get account transactions of other user in the same domain
+     * @then Return account transactions
+     */
+    TEST_F(GetAccountTransactionsExecutorTest, ValidDomainAccountWithRoot) {
+      addPerms({shared_model::interface::permissions::Role::kGetDomainAccTxs});
+
+      commitBlocks();
+
+      auto query = TestQueryBuilder()
+                       .creatorAccountId(account_id)
+                       .getAccountTransactions(account_id2, kTxPageSize)
+                       .build();
+      auto result = executeQuery(query);
+      checkSuccessfulResult<shared_model::interface::TransactionsPageResponse>(
+          std::move(result), [](const auto &cast_resp) {
+            ASSERT_EQ(cast_resp.transactions().size(), 2);
+            for (const auto &tx : cast_resp.transactions()) {
+              EXPECT_EQ(account_id2, tx.creatorAccountId()) << tx.toString();
+            }
+          });
     }
 
     // ------------------------/ tx pagination tests \----------------------- //
@@ -2325,6 +2350,31 @@ namespace iroha {
           std::move(result), 4);
     }
 
+    /**
+     * @given initialized storage, root permission
+     * @when get transactions of other user
+     * @then Return transactions
+     */
+    TEST_F(GetTransactionsHashExecutorTest, ValidAllAccountsWithRoot) {
+      addPerms({shared_model::interface::permissions::Role::kRoot});
+
+      commitBlocks();
+
+      std::vector<decltype(hash3)> hashes;
+      hashes.push_back(hash3);
+
+      auto query = TestQueryBuilder()
+                       .creatorAccountId(account_id)
+                       .getTransactions(hashes)
+                       .build();
+      auto result = executeQuery(query);
+      checkSuccessfulResult<shared_model::interface::TransactionsResponse>(
+          std::move(result), [this](const auto &cast_resp) {
+            ASSERT_EQ(cast_resp.transactions().size(), 1);
+            ASSERT_EQ(cast_resp.transactions()[0].hash(), hash3);
+          });
+    }
+
     using GetAccountAssetTransactionsExecutorTest =
         GetPagedTransactionsExecutorTest<GetAccountAssetTxPaginationImpl>;
 
@@ -2426,7 +2476,7 @@ namespace iroha {
      * @then corresponding error is returned
      */
     TEST_F(GetAccountAssetTransactionsExecutorTest, InvalidAccountId) {
-      addAllPerms();
+      addAllPermsWithoutRoot();
 
       auto query = TestQueryBuilder()
                        .creatorAccountId(account_id)
@@ -2444,7 +2494,7 @@ namespace iroha {
      * @then corresponding error is returned
      */
     TEST_F(GetAccountAssetTransactionsExecutorTest, InvalidAssetId) {
-      addAllPerms();
+      addAllPermsWithoutRoot();
 
       auto query =
           TestQueryBuilder()
@@ -2515,6 +2565,79 @@ namespace iroha {
           executeQuery(query), 4);
     }
 
+    /**
+     * @given initialized storage, root permission
+     * @when get account asset transactions
+     * @then Return account asset transactions of user
+     */
+    TEST_F(GetAccountAssetTransactionsExecutorTest, ValidMyAccountWithRoot) {
+      addPerms({shared_model::interface::permissions::Role::kRoot});
+
+      commitBlocks();
+
+      auto query =
+          TestQueryBuilder()
+              .creatorAccountId(account_id)
+              .getAccountAssetTransactions(account_id, asset_id, kTxPageSize)
+              .build();
+      auto result = executeQuery(query);
+      checkSuccessfulResult<shared_model::interface::TransactionsPageResponse>(
+          std::move(result), [this](const auto &cast_resp) {
+            ASSERT_EQ(cast_resp.transactions().size(), 2);
+            ASSERT_EQ(cast_resp.transactions()[0].hash(), hash2);
+            ASSERT_EQ(cast_resp.transactions()[1].hash(), hash3);
+          });
+    }
+
+    /**
+     * @given initialized storage, root permission
+     * @when get account asset transactions of other user
+     * @then Return account asset transactions
+     */
+    TEST_F(GetAccountAssetTransactionsExecutorTest, ValidAllAccountsWithRoot) {
+      addPerms({shared_model::interface::permissions::Role::kRoot});
+
+      commitBlocks();
+
+      auto query =
+          TestQueryBuilder()
+              .creatorAccountId(account_id)
+              .getAccountAssetTransactions(account_id2, asset_id, kTxPageSize)
+              .build();
+      auto result = executeQuery(query);
+      checkSuccessfulResult<shared_model::interface::TransactionsPageResponse>(
+          std::move(result), [this](const auto &cast_resp) {
+            ASSERT_EQ(cast_resp.transactions().size(), 2);
+            ASSERT_EQ(cast_resp.transactions()[0].hash(), hash2);
+            ASSERT_EQ(cast_resp.transactions()[1].hash(), hash3);
+          });
+    }
+
+    /**
+     * @given initialized storage, root permission
+     * @when get account asset transactions of other user in the same domain
+     * @then Return account asset transactions
+     */
+    TEST_F(GetAccountAssetTransactionsExecutorTest,
+           ValidDomainAccountWithRoot) {
+      addPerms({shared_model::interface::permissions::Role::kRoot});
+
+      commitBlocks();
+
+      auto query =
+          TestQueryBuilder()
+              .creatorAccountId(account_id)
+              .getAccountAssetTransactions(account_id2, asset_id, kTxPageSize)
+              .build();
+      auto result = executeQuery(query);
+      checkSuccessfulResult<shared_model::interface::TransactionsPageResponse>(
+          std::move(result), [this](const auto &cast_resp) {
+            ASSERT_EQ(cast_resp.transactions().size(), 2);
+            ASSERT_EQ(cast_resp.transactions()[0].hash(), hash2);
+            ASSERT_EQ(cast_resp.transactions()[1].hash(), hash3);
+          });
+    }
+
     class GetPeersExecutorTest : public QueryExecutorTest {};
 
     /**
@@ -2547,6 +2670,25 @@ namespace iroha {
       auto result = executeQuery(query);
       checkStatefulError<shared_model::interface::StatefulFailedErrorResponse>(
           std::move(result), kNoPermissions);
+    }
+
+    /**
+     * @given initialized storage, root permission
+     * @when get peers query issued
+     * @then return peers
+     */
+    TEST_F(GetPeersExecutorTest, ValidWithRoot) {
+      addPerms({shared_model::interface::permissions::Role::kRoot});
+      auto query =
+          TestQueryBuilder().creatorAccountId(account_id).getPeers().build();
+      auto result = executeQuery(query);
+      checkSuccessfulResult<shared_model::interface::PeersResponse>(
+          std::move(result), [&expected_peer = peer](const auto &cast_resp) {
+            ASSERT_EQ(boost::size(cast_resp.peers()), 1);
+            auto &peer = cast_resp.peers().front();
+            ASSERT_EQ(peer.address(), expected_peer.address());
+            ASSERT_EQ(peer.pubkey(), expected_peer.pubkey());
+          });
     }
 
   }  // namespace ametsuchi

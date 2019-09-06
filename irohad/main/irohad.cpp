@@ -18,6 +18,7 @@
 #include "logger/logger.hpp"
 #include "logger/logger_manager.hpp"
 #include "main/application.hpp"
+#include "main/impl/pg_connection_init.hpp"
 #include "main/iroha_conf_literals.hpp"
 #include "main/iroha_conf_loader.hpp"
 #include "main/raw_block_loader.hpp"
@@ -28,6 +29,7 @@ static const std::string kLogSettingsFromConfigFile = "config_file";
 static const uint32_t kMstExpirationTimeDefault = 1440;
 static const uint32_t kMaxRoundsDelayDefault = 3000;
 static const uint32_t kStaleStreamMaxRoundsDefault = 2;
+static const std::string kDefaultWorkingDatabaseName{"iroha_default"};
 
 /**
  * Gflag validator.
@@ -174,10 +176,29 @@ int main(int argc, char *argv[]) {
     return EXIT_FAILURE;
   }
 
+  std::unique_ptr<iroha::ametsuchi::PostgresOptions> pg_opt;
+  if (config.database_config) {
+    pg_opt = std::make_unique<iroha::ametsuchi::PostgresOptions>(
+        config.database_config->host,
+        config.database_config->port,
+        config.database_config->user,
+        config.database_config->password,
+        config.database_config->working_dbname,
+        config.database_config->maintenance_dbname,
+        log);
+  } else if (config.pg_opt) {
+    log->warn("Using deprecated database connection string!");
+    pg_opt = std::make_unique<iroha::ametsuchi::PostgresOptions>(
+        config.pg_opt.value(), kDefaultWorkingDatabaseName, log);
+  } else {
+    log->critical("Missing database configuration!");
+    return EXIT_FAILURE;
+  }
+
   // Configuring iroha daemon
   Irohad irohad(
       config.block_store_path,
-      config.pg_opt,
+      std::move(pg_opt),
       kListenIp,  // TODO(mboldyrev) 17/10/2018: add a parameter in
                   // config file and/or command-line arguments?
       config.torii_port,
@@ -194,7 +215,8 @@ int main(int argc, char *argv[]) {
       std::move(config.initial_peers),
       log_manager->getChild("Irohad"),
       boost::make_optional(config.mst_support,
-                           iroha::GossipPropagationStrategyParams{}));
+                           iroha::GossipPropagationStrategyParams{}),
+      config.torii_tls_params);
 
   // Check if iroha daemon storage was successfully initialized
   if (not irohad.storage) {
@@ -255,7 +277,10 @@ int main(int argc, char *argv[]) {
       // clear previous storage if any
       irohad.dropStorage();
 
-      irohad.storage->insertBlock(block.value());
+      if (not irohad.storage->insertBlock(block.value())) {
+        log->critical("Could not apply genesis block!");
+        return EXIT_FAILURE;
+      }
       log->info("Genesis block inserted, number of transactions: {}",
                 block.value()->transactions().size());
     }

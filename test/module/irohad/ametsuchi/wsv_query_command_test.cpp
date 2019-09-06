@@ -25,10 +25,8 @@ namespace iroha {
                                               pgopt_);
 
         command = std::make_unique<PostgresWsvCommand>(*sql);
-        query = std::make_unique<PostgresWsvQuery>(
-            *sql, factory, getTestLogger("WsvQuery"));
-
-        *sql << init_;
+        query =
+            std::make_unique<PostgresWsvQuery>(*sql, getTestLogger("WsvQuery"));
       }
 
       void TearDown() override {

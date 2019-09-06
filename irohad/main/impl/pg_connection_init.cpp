@@ -5,6 +5,7 @@
 
 #include "main/impl/pg_connection_init.hpp"
 
+#include "ametsuchi/impl/pool_wrapper.hpp"
 #include "logger/logger.hpp"
 #include "logger/logger_manager.hpp"
 
@@ -39,13 +40,13 @@ PgConnectionInit::initPostgresConnection(std::string &options_str,
   return expected::makeValue(pool);
 }
 
-iroha::expected::Result<PoolWrapper, std::string>
+iroha::expected::Result<std::shared_ptr<PoolWrapper>, std::string>
 PgConnectionInit::prepareConnectionPool(
     const ReconnectionStrategyFactory &reconnection_strategy_factory,
     const PostgresOptions &options,
     const int pool_size,
     logger::LoggerManagerTreePtr log_manager) {
-  auto options_str = options.optionsString();
+  auto options_str = options.workingConnectionString();
 
   auto conn = initPostgresConnection(options_str, pool_size);
   if (auto e = boost::get<expected::Error<std::string>>(&conn)) {
@@ -59,11 +60,9 @@ PgConnectionInit::prepareConnectionPool(
   soci::session sql(*connection);
   bool enable_prepared_transactions = preparedTransactionsAvailable(sql);
   try {
-    std::string prepared_block_name = "prepared_block" + options.dbname();
-
     auto try_rollback = [&](soci::session &session) {
       if (enable_prepared_transactions) {
-        rollbackPrepared(session, prepared_block_name)
+        rollbackPrepared(session, options.preparedBlockName())
             .match([](auto &&v) {},
                    [&](auto &&e) {
                      log_manager->getLogger()->warn(
@@ -77,15 +76,14 @@ PgConnectionInit::prepareConnectionPool(
 
     initializeConnectionPool(*connection,
                              pool_size,
-                             init_,
                              try_rollback,
                              *failover_callback_factory,
                              reconnection_strategy_factory,
-                             options.optionsStringWithoutDbName(),
+                             options.maintenanceConnectionString(),
                              log_manager);
 
-    return expected::makeValue<PoolWrapper>(
-        iroha::ametsuchi::PoolWrapper(std::move(connection),
+    return expected::makeValue<std::shared_ptr<PoolWrapper>>(
+        std::make_shared<PoolWrapper>(std::move(connection),
                                       std::move(failover_callback_factory),
                                       enable_prepared_transactions));
 
@@ -115,25 +113,19 @@ iroha::expected::Result<void, std::string> PgConnectionInit::rollbackPrepared(
 }
 
 iroha::expected::Result<bool, std::string>
-PgConnectionInit::createDatabaseIfNotExist(
-    const std::string &dbname, const std::string &options_str_without_dbname) {
+PgConnectionInit::checkIfWorkingDatabaseExists(const PostgresOptions &pg_opt) {
   try {
-    soci::session sql(*soci::factory_postgresql(), options_str_without_dbname);
+    soci::session sql(*soci::factory_postgresql(),
+                      pg_opt.maintenanceConnectionString());
 
-    int size;
-    std::string name = dbname;
+    size_t count;
+    std::string working_dbname = pg_opt.workingDbName();
 
     sql << "SELECT count(datname) FROM pg_catalog.pg_database WHERE "
            "datname = :dbname",
-        soci::into(size), soci::use(name);
+        soci::into(count), soci::use(working_dbname, "dbname");
 
-    if (size == 0) {
-      std::string query = "CREATE DATABASE ";
-      query += dbname;
-      sql << query;
-      return expected::makeValue(true);
-    }
-    return expected::makeValue(false);
+    return expected::makeValue(count == 1);
   } catch (std::exception &e) {
     return expected::makeError<std::string>(
         std::string("Connection to PostgreSQL broken: ")
@@ -141,11 +133,31 @@ PgConnectionInit::createDatabaseIfNotExist(
   }
 }
 
+iroha::expected::Result<bool, std::string>
+PgConnectionInit::createDatabaseIfNotExist(const PostgresOptions &pg_opt) {
+  return checkIfWorkingDatabaseExists(pg_opt) |
+             [&pg_opt](
+                 bool db_exists) -> iroha::expected::Result<bool, std::string> {
+    try {
+      if (not db_exists) {
+        soci::session sql(*soci::factory_postgresql(),
+                          pg_opt.maintenanceConnectionString());
+        sql << "CREATE DATABASE " + pg_opt.workingDbName();
+        return expected::makeValue(true);
+      }
+      return expected::makeValue(false);
+    } catch (std::exception &e) {
+      return expected::makeError<std::string>(
+          std::string("Connection to PostgreSQL broken: ")
+          + formatPostgresMessage(e.what()));
+    }
+  };
+}
+
 template <typename RollbackFunction>
 void PgConnectionInit::initializeConnectionPool(
     soci::connection_pool &connection_pool,
     size_t pool_size,
-    const std::string &prepare_tables_sql,
     RollbackFunction try_rollback,
     FailoverCallbackHolder &callback_factory,
     const ReconnectionStrategyFactory &reconnection_strategy_factory,
@@ -163,7 +175,6 @@ void PgConnectionInit::initializeConnectionPool(
     // TODO: 2019-05-06 @muratovv rework unhandled exception with Result
     // IR-464
     on_init_db(session);
-    PostgresCommandExecutor::prepareStatements(session);
   };
 
   /// lambda contains special actions which should be execute once
@@ -171,7 +182,7 @@ void PgConnectionInit::initializeConnectionPool(
     // rollback current prepared transaction
     // if there exists any since last session
     try_rollback(session);
-    session << prepare_tables_sql;
+    prepareTables(session);
   };
 
   /// lambda contains actions which should be invoked once for each
@@ -203,9 +214,8 @@ void PgConnectionInit::initializeConnectionPool(
   }
 }
 
-const std::string PgConnectionInit::kDefaultDatabaseName{"iroha_default"};
-
-const std::string PgConnectionInit::init_ = R"(
+void PgConnectionInit::prepareTables(soci::session &session) {
+  static const std::string prepare_tables_sql = R"(
 CREATE TABLE IF NOT EXISTS role (
     role_id character varying(32),
     PRIMARY KEY (role_id)
@@ -240,7 +250,6 @@ CREATE TABLE IF NOT EXISTS asset (
     asset_id character varying(288),
     domain_id character varying(255) NOT NULL REFERENCES domain,
     precision int NOT NULL,
-    data json,
     PRIMARY KEY (asset_id)
 );
 CREATE TABLE IF NOT EXISTS account_has_asset (
@@ -252,8 +261,8 @@ CREATE TABLE IF NOT EXISTS account_has_asset (
 CREATE TABLE IF NOT EXISTS role_has_permissions (
     role_id character varying(32) NOT NULL REFERENCES role,
     permission bit()"
-    + std::to_string(shared_model::interface::RolePermissionSet::size())
-    + R"() NOT NULL,
+      + std::to_string(shared_model::interface::RolePermissionSet::size())
+      + R"() NOT NULL,
     PRIMARY KEY (role_id)
 );
 CREATE TABLE IF NOT EXISTS account_has_roles (
@@ -265,8 +274,8 @@ CREATE TABLE IF NOT EXISTS account_has_grantable_permissions (
     permittee_account_id character varying(288) NOT NULL REFERENCES account,
     account_id character varying(288) NOT NULL REFERENCES account,
     permission bit()"
-    + std::to_string(shared_model::interface::GrantablePermissionSet::size())
-    + R"() NOT NULL,
+      + std::to_string(shared_model::interface::GrantablePermissionSet::size())
+      + R"() NOT NULL,
     PRIMARY KEY (permittee_account_id, account_id)
 );
 CREATE TABLE IF NOT EXISTS position_by_hash (
@@ -274,19 +283,15 @@ CREATE TABLE IF NOT EXISTS position_by_hash (
     height bigint,
     index bigint
 );
-
 CREATE TABLE IF NOT EXISTS tx_status_by_hash (
     hash varchar,
     status boolean
 );
-CREATE INDEX IF NOT EXISTS tx_status_by_hash_hash_index ON tx_status_by_hash USING hash (hash);
-
-CREATE TABLE IF NOT EXISTS height_by_account_set (
-    account_id text,
-    height bigint
-);
-CREATE TABLE IF NOT EXISTS index_by_creator_height (
-    id serial,
+CREATE INDEX IF NOT EXISTS tx_status_by_hash_hash_index
+  ON tx_status_by_hash
+  USING hash
+  (hash);
+CREATE TABLE IF NOT EXISTS tx_position_by_creator (
     creator_id text,
     height bigint,
     index bigint
@@ -297,7 +302,13 @@ CREATE TABLE IF NOT EXISTS position_by_account_asset (
     height bigint,
     index bigint
 );
-)";
+CREATE INDEX IF NOT EXISTS position_by_account_asset_index
+  ON position_by_account_asset
+  USING btree
+  (account_id, asset_id, height, index ASC);
+  )";
+  session << prepare_tables_sql;
+}
 
 iroha::expected::Result<void, std::string> PgConnectionInit::resetWsv(
     soci::session &sql) {
@@ -316,14 +327,27 @@ iroha::expected::Result<void, std::string> PgConnectionInit::resetWsv(
       TRUNCATE TABLE role RESTART IDENTITY CASCADE;
       TRUNCATE TABLE position_by_hash RESTART IDENTITY CASCADE;
       TRUNCATE TABLE tx_status_by_hash RESTART IDENTITY CASCADE;
-      TRUNCATE TABLE height_by_account_set RESTART IDENTITY CASCADE;
-      TRUNCATE TABLE index_by_creator_height RESTART IDENTITY CASCADE;
+      TRUNCATE TABLE tx_position_by_creator RESTART IDENTITY CASCADE;
       TRUNCATE TABLE position_by_account_asset RESTART IDENTITY CASCADE;
     )";
     sql << reset;
   } catch (std::exception &e) {
     return iroha::expected::makeError(std::string{"Failed to reset WSV: "}
                                       + formatPostgresMessage(e.what()));
+  }
+  return expected::Value<void>();
+}
+
+iroha::expected::Result<void, std::string>
+PgConnectionInit::dropWorkingDatabase(const PostgresOptions &options) {
+  soci::session sql(*soci::factory_postgresql(),
+                    options.maintenanceConnectionString());
+  try {
+    sql << "DROP DATABASE " + options.workingDbName();
+  } catch (std::exception &e) {
+    return iroha::expected::makeError(
+        std::string{"Failed to drop working database: "}
+        + formatPostgresMessage(e.what()));
   }
   return expected::Value<void>();
 }

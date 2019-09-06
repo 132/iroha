@@ -8,9 +8,17 @@
 namespace config_members {
   const char *BlockStorePath = "block_store_path";
   const char *ToriiPort = "torii_port";
+  const char *ToriiTlsParams = "torii_tls_params";
   const char *InternalPort = "internal_port";
   const char *KeyPairPath = "key_pair_path";
   const char *PgOpt = "pg_opt";
+  const char *DbConfig = "database";
+  const char *Host = "host";
+  const char *Port = "port";
+  const char *User = "user";
+  const char *Password = "password";
+  const char *WorkingDbName = "working database";
+  const char *MaintenanceDbName = "maintenance database";
   const char *MaxProposalSize = "max_proposal_size";
   const char *ProposalDelay = "proposal_delay";
   const char *VoteDelay = "vote_delay";

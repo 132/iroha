@@ -61,6 +61,9 @@ namespace shared_model {
         kAddDomainAssetQty,
         kSubtractDomainAssetQty,
         kGetPeers,
+        kRemovePeer,
+        kRoot,
+
         COUNT
       };
 
@@ -99,7 +102,10 @@ namespace shared_model {
       // TODO [IR-1889] Akvinikym 21.11.18: introduce toString() method
       std::string toBitstring() const;
 
-      static size_t size();
+      static constexpr size_t size() {
+        return static_cast<size_t>(Perm::COUNT);
+      }
+
       PermissionSet &unsetAll();
       PermissionSet &setAll();
       PermissionSet &set(Perm p);

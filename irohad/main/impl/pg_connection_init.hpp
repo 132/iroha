@@ -14,7 +14,6 @@
 #include <boost/range/algorithm/replace_if.hpp>
 
 #include "ametsuchi/impl/failover_callback_holder.hpp"
-#include "ametsuchi/impl/pool_wrapper.hpp"
 #include "ametsuchi/impl/postgres_command_executor.hpp"
 #include "ametsuchi/impl/postgres_options.hpp"
 #include "ametsuchi/reconnection_strategy.hpp"
@@ -25,13 +24,17 @@
 
 namespace iroha {
   namespace ametsuchi {
+
+    struct PoolWrapper;
+
     class PgConnectionInit {
      public:
       static expected::Result<std::shared_ptr<soci::connection_pool>,
                               std::string>
       initPostgresConnection(std::string &options_str, size_t pool_size);
 
-      static expected::Result<PoolWrapper, std::string> prepareConnectionPool(
+      static expected::Result<std::shared_ptr<PoolWrapper>, std::string>
+      prepareConnectionPool(
           const ReconnectionStrategyFactory &reconnection_strategy_factory,
           const PostgresOptions &options,
           const int pool_size,
@@ -45,9 +48,23 @@ namespace iroha {
       static iroha::expected::Result<void, std::string> rollbackPrepared(
           soci::session &sql, const std::string &prepared_block_name);
 
+      /*
+       * Check whether working database exists.
+       * @param pg_opt Database options.
+       * @return Result of bool that is true if the database exists and false
+       * otherwise, or error message if check has failed.
+       */
+      static expected::Result<bool, std::string> checkIfWorkingDatabaseExists(
+          const PostgresOptions &pg_opt);
+
+      /*
+       * Create working database if it does not exist.
+       * @param pg_opt Database options.
+       * @return Result of bool that is true if the database was creates and
+       * false otherwise, or error message if something has gone wrong.
+       */
       static expected::Result<bool, std::string> createDatabaseIfNotExist(
-          const std::string &dbname,
-          const std::string &options_str_without_dbname);
+          const PostgresOptions &pg_opt);
 
       /*
        * Remove all records from the tables
@@ -55,18 +72,27 @@ namespace iroha {
        */
       static expected::Result<void, std::string> resetWsv(soci::session &sql);
 
+      /*
+       * Drop working database.
+       * @return Error message if dropping has failed.
+       */
+      static expected::Result<void, std::string> dropWorkingDatabase(
+          const PostgresOptions &options);
+
       /**
        * Removes all peers from WSV
        * @return error message if reset has failed
        */
       static expected::Result<void, std::string> resetPeers(soci::session &sql);
 
+      /// Create tables in the given session. Left public for tests.
+      static void prepareTables(soci::session &session);
+
      private:
       /**
        * Function initializes existing connection pool
        * @param connection_pool - pool with connections
        * @param pool_size - number of connections in pool
-       * @param prepare_tables_sql - sql code for db initialization
        * @param try_rollback - function which performs blocks rollback before
        * initialization
        * @param callback_factory - factory for reconnect callbacks
@@ -81,16 +107,11 @@ namespace iroha {
       static void initializeConnectionPool(
           soci::connection_pool &connection_pool,
           size_t pool_size,
-          const std::string &prepare_tables_sql,
           RollbackFunction try_rollback,
           FailoverCallbackHolder &callback_factory,
           const ReconnectionStrategyFactory &reconnection_strategy_factory,
           const std::string &pg_reconnection_options,
           logger::LoggerManagerTreePtr log_manager);
-
-     public:
-      static const std::string kDefaultDatabaseName;
-      static const std::string init_;
     };
   }  // namespace ametsuchi
 }  // namespace iroha

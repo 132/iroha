@@ -7,6 +7,7 @@
 #include "ametsuchi/impl/postgres_query_executor.hpp"
 #include "ametsuchi/impl/postgres_wsv_query.hpp"
 #include "backend/protobuf/proto_permission_to_string.hpp"
+#include "framework/common_constants.hpp"
 #include "framework/result_fixture.hpp"
 #include "framework/test_logger.hpp"
 #include "module/irohad/ametsuchi/ametsuchi_fixture.hpp"
@@ -15,18 +16,22 @@
 #include "module/shared_model/interface_mocks.hpp"
 #include "module/shared_model/mock_objects_factories/mock_command_factory.hpp"
 
+using namespace common_constants;
+
 namespace iroha {
   namespace ametsuchi {
 
     using ::testing::HasSubstr;
 
     using namespace framework::expected;
+    using namespace common_constants;
+
+    static const std::string domain_id{"domain"};
 
     class CommandExecutorTest : public AmetsuchiTest {
       // TODO [IR-1831] Akvinikym 31.10.18: rework the CommandExecutorTest
      public:
       CommandExecutorTest() {
-        domain_id = "domain";
         name = "id";
         account_id = name + "@" + domain_id;
 
@@ -40,24 +45,17 @@ namespace iroha {
 
       void SetUp() override {
         AmetsuchiTest::SetUp();
-        sql = std::make_unique<soci::session>(*soci::factory_postgresql(),
-                                              pgopt_);
 
-        auto factory =
-            std::make_shared<shared_model::proto::ProtoCommonObjectsFactory<
-                shared_model::validation::FieldValidator>>(
-                iroha::test::kTestsValidatorsConfig);
-        wsv_query = std::make_unique<PostgresWsvQuery>(
-            *sql, factory, getTestLogger("WcvQuery"));
-        PostgresCommandExecutor::prepareStatements(*sql);
-        executor =
-            std::make_unique<PostgresCommandExecutor>(*sql, perm_converter);
+        auto sql = std::make_unique<soci::session>(*soci::factory_postgresql(),
+                                                   pgopt_);
+        wsv_query =
+            std::make_unique<PostgresWsvQuery>(*sql, getTestLogger("WsvQuery"));
 
-        *sql << init_;
+        executor = std::make_unique<PostgresCommandExecutor>(std::move(sql),
+                                                             perm_converter);
       }
 
       void TearDown() override {
-        sql->close();
         AmetsuchiTest::TearDown();
       }
 
@@ -75,9 +73,11 @@ namespace iroha {
                             const shared_model::interface::types::AccountIdType
                                 &creator = "id@domain") {
         // TODO igor-egorov 15.04.2019 IR-446 Refactor postgres_executor_test
-        executor->doValidation(not do_validation);
-        executor->setCreatorAccountId(creator);
-        return executor->operator()(std::forward<CommandType>(command));
+        shared_model::interface::Command::CommandVariantType variant{
+            std::forward<CommandType>(command)};
+        shared_model::interface::MockCommand cmd;
+        EXPECT_CALL(cmd, get()).WillRepeatedly(::testing::ReturnRef(variant));
+        return executor->execute(cmd, creator, not do_validation);
       }
 
       /**
@@ -85,7 +85,7 @@ namespace iroha {
        * @param result to be checked
        */
 #define CHECK_SUCCESSFUL_RESULT(result) \
-  { ASSERT_TRUE(val(result)); }
+  { ASSERT_TRUE(val(result)) << err(result)->error; }
 
       /**
        * Check that command result contains specific error code and error
@@ -120,6 +120,23 @@ namespace iroha {
             true));
       }
 
+      void addAllPermsWithoutRoot(
+          const shared_model::interface::types::AccountIdType &account_id =
+              "id@domain",
+          const shared_model::interface::types::RoleIdType &role_id =
+              "allWithoutRoot") {
+        shared_model::interface::RolePermissionSet permissions;
+        permissions.setAll();
+        permissions.unset(shared_model::interface::permissions::Role::kRoot);
+
+        CHECK_SUCCESSFUL_RESULT(execute(
+            *mock_command_factory->constructCreateRole(role_id, permissions),
+            true));
+        CHECK_SUCCESSFUL_RESULT(execute(
+            *mock_command_factory->constructAppendRole(account_id, role_id),
+            true));
+      }
+
       /**
        * Add one specific permission for account
        * @param perm - role permission to add
@@ -139,6 +156,18 @@ namespace iroha {
         CHECK_SUCCESSFUL_RESULT(execute(
             *mock_command_factory->constructAppendRole(account_id, role_id),
             true));
+      }
+
+      /**
+       * Add an asset and check command success
+       */
+      void addAsset(const std::string &name = "coin",
+                    const std::string &domain = domain_id,
+                    size_t precision = 1) {
+        CHECK_SUCCESSFUL_RESULT(
+            execute(*mock_command_factory->constructCreateAsset(
+                        name, domain, precision),
+                    true));
       }
 
       /*
@@ -168,198 +197,24 @@ namespace iroha {
       const std::string another_role = "role2";
       shared_model::interface::RolePermissionSet role_permissions;
       shared_model::interface::permissions::Grantable grantable_permission;
-      shared_model::interface::types::DomainIdType domain_id;
       shared_model::interface::types::AccountIdType account_id, name;
       std::unique_ptr<shared_model::interface::types::PubkeyType> pubkey;
-      std::unique_ptr<soci::session> sql;
 
       std::unique_ptr<shared_model::interface::Command> command;
 
-      std::unique_ptr<WsvQuery> wsv_query;
       std::unique_ptr<CommandExecutor> executor;
+      std::unique_ptr<WsvQuery> wsv_query;
 
       std::shared_ptr<shared_model::interface::PermissionToString>
           perm_converter =
               std::make_shared<shared_model::proto::ProtoPermissionToString>();
 
-      const shared_model::interface::Amount uint256_halfmax{
-          "5789604461865809771178549250434395392663499233282028201972879200"
-          "3956"
-          "564819966.0"};  // 2**255
       const shared_model::interface::Amount asset_amount_one_zero{"1.0"};
 
       std::unique_ptr<shared_model::interface::MockCommandFactory>
           mock_command_factory =
               std::make_unique<shared_model::interface::MockCommandFactory>();
     };
-
-    class AddAccountAssetTest : public CommandExecutorTest {
-     public:
-      void SetUp() override {
-        CommandExecutorTest::SetUp();
-
-        createDefaultRole();
-        createDefaultDomain();
-        createDefaultAccount();
-      }
-      /**
-       * Add default asset and check that it is done
-       */
-      void addAsset(const shared_model::interface::types::DomainIdType
-                        &domain_id = "domain") {
-        CHECK_SUCCESSFUL_RESULT(execute(
-            *mock_command_factory->constructCreateAsset("coin", domain_id, 1),
-            true));
-      }
-
-      shared_model::interface::types::AssetIdType asset_id =
-          "coin#" + domain_id;
-    };
-
-    /**
-     * @given addAccountAsset command
-     * @when trying to add asset to account
-     * @then account asset is successfully added
-     */
-    TEST_F(AddAccountAssetTest, Valid) {
-      addAsset();
-      addAllPerms();
-
-      CHECK_SUCCESSFUL_RESULT(
-          execute(*mock_command_factory->constructAddAssetQuantity(
-              asset_id, asset_amount_one_zero)));
-
-      auto account_asset = sql_query->getAccountAsset(account_id, asset_id);
-      ASSERT_TRUE(account_asset);
-      ASSERT_EQ(asset_amount_one_zero, account_asset.get()->balance());
-
-      CHECK_SUCCESSFUL_RESULT(
-          execute(*mock_command_factory->constructAddAssetQuantity(
-              asset_id, asset_amount_one_zero)));
-
-      account_asset = sql_query->getAccountAsset(account_id, asset_id);
-      ASSERT_TRUE(account_asset);
-      ASSERT_EQ("2.0", account_asset.get()->balance().toStringRepr());
-    }
-
-    /**
-     * @given addAccountAsset command
-     * @when trying to add asset to account with a domain permission
-     * @then account asset is successfully added
-     */
-    TEST_F(AddAccountAssetTest, DomainPermValid) {
-      addAsset();
-      addOnePerm(
-          shared_model::interface::permissions::Role::kAddDomainAssetQty);
-
-      CHECK_SUCCESSFUL_RESULT(
-          execute(*mock_command_factory->constructAddAssetQuantity(
-              asset_id, asset_amount_one_zero)));
-
-      auto account_asset = sql_query->getAccountAsset(account_id, asset_id);
-      ASSERT_TRUE(account_asset);
-      ASSERT_EQ(asset_amount_one_zero, account_asset.get()->balance());
-
-      CHECK_SUCCESSFUL_RESULT(
-          execute(*mock_command_factory->constructAddAssetQuantity(
-              asset_id, asset_amount_one_zero)));
-
-      account_asset = sql_query->getAccountAsset(account_id, asset_id);
-      ASSERT_TRUE(account_asset);
-      ASSERT_EQ("2.0", account_asset.get()->balance().toStringRepr());
-    }
-
-    /**
-     * @given addAccountAsset command and invalid domain permission
-     * @when trying to add asset
-     * @then account asset is not added
-     */
-    TEST_F(AddAccountAssetTest, DomainPermInvalid) {
-      shared_model::interface::types::DomainIdType domain2_id = "domain2";
-      CHECK_SUCCESSFUL_RESULT(execute(
-          *mock_command_factory->constructCreateDomain(domain2_id, role),
-          true));
-      addAsset(domain2_id);
-      addOnePerm(
-          shared_model::interface::permissions::Role::kAddDomainAssetQty);
-
-      auto asset2_id = "coin#" + domain2_id;
-
-      CHECK_SUCCESSFUL_RESULT(
-          execute(*mock_command_factory->constructAddAssetQuantity(
-                      asset2_id, asset_amount_one_zero),
-                  true));
-
-      auto account_asset = sql_query->getAccountAsset(account_id, asset2_id);
-      ASSERT_TRUE(account_asset);
-      ASSERT_EQ(asset_amount_one_zero, account_asset.get()->balance());
-
-      auto cmd_result =
-          execute(*mock_command_factory->constructAddAssetQuantity(
-              asset2_id, asset_amount_one_zero));
-
-      std::vector<std::string> query_args{
-          account_id, asset_amount_one_zero.toStringRepr(), asset2_id, "1"};
-      CHECK_ERROR_CODE_AND_MESSAGE(cmd_result, 2, query_args);
-    }
-
-    /**
-     * @given command
-     * @when trying to add account asset without permission
-     * @then account asset not added
-     */
-    TEST_F(AddAccountAssetTest, NoPerms) {
-      addAsset();
-
-      auto add_asset = mock_command_factory->constructAddAssetQuantity(
-          asset_id, asset_amount_one_zero);
-      CHECK_SUCCESSFUL_RESULT(execute(*add_asset, true));
-
-      auto account_asset = sql_query->getAccountAsset(account_id, asset_id);
-      ASSERT_TRUE(account_asset);
-      ASSERT_EQ(asset_amount_one_zero, account_asset.get()->balance());
-
-      auto cmd_result = execute(*add_asset);
-
-      std::vector<std::string> query_args{
-          account_id, asset_amount_one_zero.toStringRepr(), asset_id, "1"};
-      CHECK_ERROR_CODE_AND_MESSAGE(cmd_result, 2, query_args);
-    }
-
-    /**
-     * @given command
-     * @when trying to add account asset with non-existing asset
-     * @then account asset fails to be added
-     */
-    TEST_F(AddAccountAssetTest, InvalidAsset) {
-      auto cmd_result =
-          execute(*mock_command_factory->constructAddAssetQuantity(
-                      asset_id, asset_amount_one_zero),
-                  true);
-
-      std::vector<std::string> query_args{
-          account_id, asset_amount_one_zero.toStringRepr(), asset_id, "1"};
-      CHECK_ERROR_CODE_AND_MESSAGE(cmd_result, 3, query_args);
-    }
-
-    /**
-     * @given command
-     * @when trying to add account asset that overflows
-     * @then account asset fails to added
-     */
-    TEST_F(AddAccountAssetTest, Uint256Overflow) {
-      addAsset();
-
-      auto add_asset = mock_command_factory->constructAddAssetQuantity(
-          asset_id, uint256_halfmax);
-      CHECK_SUCCESSFUL_RESULT(execute(*add_asset, true));
-
-      auto cmd_result = execute(*add_asset, true);
-
-      std::vector<std::string> query_args{
-          account_id, uint256_halfmax.toStringRepr(), asset_id, "1"};
-      CHECK_ERROR_CODE_AND_MESSAGE(cmd_result, 4, query_args);
-    }
 
     class AddPeer : public CommandExecutorTest {
      public:
@@ -401,103 +256,145 @@ namespace iroha {
     TEST_F(AddPeer, NoPerms) {
       auto cmd_result = execute(*mock_command_factory->constructAddPeer(*peer));
 
-      std::vector<std::string> query_args{peer->toString()};
+      std::vector<std::string> query_args{peer->address(),
+                                          peer->pubkey().hex()};
       CHECK_ERROR_CODE_AND_MESSAGE(cmd_result, 2, query_args);
     }
 
-    class AddSignatory : public CommandExecutorTest {
+    /**
+     * @given command, root permission
+     * @when trying to add peer
+     * @then peer is successfully added
+     */
+    TEST_F(AddPeer, ValidWithRoot) {
+      addOnePerm(shared_model::interface::permissions::Role::kRoot);
+      CHECK_SUCCESSFUL_RESULT(
+          execute(*mock_command_factory->constructAddPeer(*peer)));
+    }
+
+    class RemovePeer : public CommandExecutorTest {
      public:
       void SetUp() override {
         CommandExecutorTest::SetUp();
+        peer = makePeer("address",
+                        shared_model::interface::types::PubkeyType{"pubkey"});
+        another_peer = makePeer(
+            "another_address",
+            shared_model::interface::types::PubkeyType{"another_pubkey"});
         createDefaultRole();
         createDefaultDomain();
+        createDefaultAccount();
         CHECK_SUCCESSFUL_RESULT(
-            execute(*mock_command_factory->constructCreateAccount(
-                        name,
-                        domain_id,
-                        shared_model::interface::types::PubkeyType(
-                            std::string('5', 32))),
-                    true));
+            execute(*mock_command_factory->constructAddPeer(*peer), true));
       }
+
+      std::unique_ptr<MockPeer> peer, another_peer;
     };
 
     /**
      * @given command
-     * @when trying to add signatory with role permission
-     * @then signatory is successfully added
+     * @when trying to remove peer
+     * @then peer is successfully removed
      */
-    TEST_F(AddSignatory, Valid) {
+    TEST_F(RemovePeer, Valid) {
       addAllPerms();
-
       CHECK_SUCCESSFUL_RESULT(execute(
-          *mock_command_factory->constructAddSignatory(*pubkey, account_id)));
+          *mock_command_factory->constructAddPeer(*another_peer), true));
 
-      auto signatories = wsv_query->getSignatories(account_id);
-      ASSERT_TRUE(signatories);
-      ASSERT_TRUE(std::find(signatories->begin(), signatories->end(), *pubkey)
-                  != signatories->end());
+      CHECK_SUCCESSFUL_RESULT(
+          execute(*mock_command_factory->constructRemovePeer(peer->pubkey())));
+
+      auto peers = wsv_query->getPeers();
+      ASSERT_TRUE(peers);
+      ASSERT_TRUE(std::find_if(peers->begin(),
+                               peers->end(),
+                               [this](const auto &peer) {
+                                 return this->peer->address() == peer->address()
+                                     and this->peer->pubkey() == peer->pubkey();
+                               })
+                  == peers->end());
     }
 
     /**
      * @given command
-     * @when trying to add signatory with grantable permission
-     * @then signatory is successfully added
+     * @when trying to remove peer without perms
+     * @then peer is not removed
      */
-    TEST_F(AddSignatory, ValidGrantablePerms) {
+    TEST_F(RemovePeer, NoPerms) {
       CHECK_SUCCESSFUL_RESULT(execute(
-          *mock_command_factory->constructCreateAccount(
-              "id2",
-              domain_id,
-              shared_model::interface::types::PubkeyType(std::string('2', 32))),
-          true));
-      auto perm =
-          shared_model::interface::permissions::Grantable::kAddMySignatory;
-      CHECK_SUCCESSFUL_RESULT(execute(
-          *mock_command_factory->constructGrantPermission(account_id, perm),
-          true,
-          "id2@domain"));
-      CHECK_SUCCESSFUL_RESULT(execute(
-          *mock_command_factory->constructAddSignatory(*pubkey, "id2@domain")));
-      auto signatories = wsv_query->getSignatories("id2@domain");
-      ASSERT_TRUE(signatories);
-      ASSERT_TRUE(std::find(signatories->begin(), signatories->end(), *pubkey)
-                  != signatories->end());
-    }
+          *mock_command_factory->constructAddPeer(*another_peer), true));
+      auto cmd_result =
+          execute(*mock_command_factory->constructRemovePeer(peer->pubkey()));
 
-    /**
-     * @given command
-     * @when trying to add signatory without permissions
-     * @then signatory is not added
-     */
-    TEST_F(AddSignatory, NoPerms) {
-      auto cmd_result = execute(
-          *mock_command_factory->constructAddSignatory(*pubkey, account_id));
-
-      std::vector<std::string> query_args{account_id, pubkey->hex()};
+      std::vector<std::string> query_args{peer->pubkey().hex()};
       CHECK_ERROR_CODE_AND_MESSAGE(cmd_result, 2, query_args);
-
-      auto signatories = wsv_query->getSignatories(account_id);
-      ASSERT_TRUE(signatories);
-      ASSERT_TRUE(std::find(signatories->begin(), signatories->end(), *pubkey)
-                  == signatories->end());
     }
 
     /**
      * @given command
-     * @when successfully adding signatory to the account @and trying to add the
-     * same signatory again
-     * @then signatory is not added
+     * @when trying to remove nonexistent peer
+     * @then peer is not removed
      */
-    TEST_F(AddSignatory, ExistingPubKey) {
-      addAllPerms();
-      CHECK_SUCCESSFUL_RESULT(execute(
-          *mock_command_factory->constructAddSignatory(*pubkey, account_id)));
-
+    TEST_F(RemovePeer, NoPeer) {
+      addAllPermsWithoutRoot();
       auto cmd_result = execute(
-          *mock_command_factory->constructAddSignatory(*pubkey, account_id));
+          *mock_command_factory->constructRemovePeer(another_peer->pubkey()));
 
-      std::vector<std::string> query_args{account_id, pubkey->hex()};
+      std::vector<std::string> query_args{another_peer->pubkey().hex()};
+      CHECK_ERROR_CODE_AND_MESSAGE(cmd_result, 3, query_args);
+    }
+
+    /**
+     * @given command
+     * @when trying to remove nonexistent peer without validation
+     * @then peer is not removed
+     */
+    TEST_F(RemovePeer, NoPeerWithoutValidation) {
+      addAllPermsWithoutRoot();
+      auto cmd_result = execute(
+          *mock_command_factory->constructRemovePeer(another_peer->pubkey()),
+          true);
+
+      std::vector<std::string> query_args{another_peer->pubkey().hex()};
+      CHECK_ERROR_CODE_AND_MESSAGE(cmd_result, 1, query_args);
+    }
+
+    /**
+     * @given command
+     * @when trying to remove the only peer in the list
+     * @then peer is not removed
+     */
+    TEST_F(RemovePeer, LastPeer) {
+      addAllPermsWithoutRoot();
+      auto cmd_result =
+          execute(*mock_command_factory->constructRemovePeer(peer->pubkey()));
+
+      std::vector<std::string> query_args{peer->pubkey().hex()};
       CHECK_ERROR_CODE_AND_MESSAGE(cmd_result, 4, query_args);
+    }
+
+    /**
+     * @given command, root permission
+     * @when trying to remove peer
+     * @then peer is successfully removed
+     */
+    TEST_F(RemovePeer, ValidWithRoot) {
+      addOnePerm(shared_model::interface::permissions::Role::kRoot);
+      CHECK_SUCCESSFUL_RESULT(execute(
+          *mock_command_factory->constructAddPeer(*another_peer), true));
+
+      CHECK_SUCCESSFUL_RESULT(
+          execute(*mock_command_factory->constructRemovePeer(peer->pubkey())));
+
+      auto peers = wsv_query->getPeers();
+      ASSERT_TRUE(peers);
+      ASSERT_TRUE(std::find_if(peers->begin(),
+                               peers->end(),
+                               [this](const auto &peer) {
+                                 return this->peer->address() == peer->address()
+                                     and this->peer->pubkey() == peer->pubkey();
+                               })
+                  == peers->end());
     }
 
     class AppendRole : public CommandExecutorTest {
@@ -618,7 +515,7 @@ namespace iroha {
      * @then role is not appended
      */
     TEST_F(AppendRole, NoAccount) {
-      addAllPerms();
+      addAllPermsWithoutRoot();
       CHECK_SUCCESSFUL_RESULT(execute(
           *mock_command_factory->constructCreateRole(another_role, {}), true));
       auto cmd_result = execute(*mock_command_factory->constructAppendRole(
@@ -634,7 +531,7 @@ namespace iroha {
      * @then role is not appended
      */
     TEST_F(AppendRole, NoRole) {
-      addAllPerms();
+      addAllPermsWithoutRoot();
       auto cmd_result = execute(
           *mock_command_factory->constructAppendRole(account_id, another_role));
 
@@ -642,76 +539,46 @@ namespace iroha {
       CHECK_ERROR_CODE_AND_MESSAGE(cmd_result, 4, query_args);
     }
 
-    class CreateAccount : public CommandExecutorTest {
-     public:
-      void SetUp() override {
-        CommandExecutorTest::SetUp();
-        account2_id = "id2@" + domain_id;
-        createDefaultRole();
-        createDefaultDomain();
-        createDefaultAccount();
-      }
-
-      shared_model::interface::types::AccountIdType account2_id;
-    };
-
     /**
-     * @given command
-     * @when trying to create account
-     * @then account is created
+     * @given command, root permission
+     * @when trying to append role
+     * @then role is appended
      */
-    TEST_F(CreateAccount, Valid) {
-      addAllPerms();
+    TEST_F(AppendRole, ValidWithRoot) {
+      addOnePerm(shared_model::interface::permissions::Role::kRoot);
       CHECK_SUCCESSFUL_RESULT(
-          execute(*mock_command_factory->constructCreateAccount(
-              "id2", domain_id, *pubkey)));
-      auto acc = sql_query->getAccount(account2_id);
-      ASSERT_TRUE(acc);
-      ASSERT_EQ(account2_id, acc.get()->accountId());
+          execute(*mock_command_factory->constructCreateRole(another_role,
+                                                             role_permissions),
+                  true));
+      CHECK_SUCCESSFUL_RESULT(
+          execute(*mock_command_factory->constructAppendRole(account_id,
+                                                             another_role)));
+      auto roles = sql_query->getAccountRoles(account_id);
+      ASSERT_TRUE(roles);
+      ASSERT_TRUE(std::find(roles->begin(), roles->end(), another_role)
+                  != roles->end());
     }
 
     /**
-     * @given command
-     * @when trying to create account without permission to do so
-     * @then account is not created
+     * @given command, root permission
+     * @when trying to append role with perms that creator does not have
+     * @then role is appended
      */
-    TEST_F(CreateAccount, NoPerms) {
-      auto cmd_result = execute(*mock_command_factory->constructCreateAccount(
-          account2_id, domain_id, *pubkey));
-      auto acc = sql_query->getAccount(account2_id);
-      ASSERT_FALSE(acc);
-
-      std::vector<std::string> query_args{
-          account2_id, domain_id, pubkey->hex()};
-      CHECK_ERROR_CODE_AND_MESSAGE(cmd_result, 2, query_args);
-    }
-
-    /**
-     * @given command @and no target domain in ledger
-     * @when trying to create account
-     * @then account is not created
-     */
-    TEST_F(CreateAccount, NoDomain) {
-      addAllPerms();
-      auto cmd_result = execute(*mock_command_factory->constructCreateAccount(
-          "doge", "domain6", *pubkey));
-
-      std::vector<std::string> query_args{"doge", "domain6", pubkey->hex()};
-      CHECK_ERROR_CODE_AND_MESSAGE(cmd_result, 3, query_args);
-    }
-
-    /**
-     * @given command
-     * @when trying to create with an occupied name
-     * @then account is not created
-     */
-    TEST_F(CreateAccount, NameExists) {
-      addAllPerms();
-      auto cmd_result = execute(*mock_command_factory->constructCreateAccount(
-          name, domain_id, *pubkey));
-
-      std::vector<std::string> query_args{name, domain_id, pubkey->hex()};
-      CHECK_ERROR_CODE_AND_MESSAGE(cmd_result, 4, query_args);
+    TEST_F(AppendRole, NoRolePermsInAccountWithRoot) {
+      addOnePerm(shared_model::interface::permissions::Role::kRoot);
+      role_permissions2.set(
+          shared_model::interface::permissions::Role::kRemoveMySignatory);
+      CHECK_SUCCESSFUL_RESULT(
+          execute(*mock_command_factory->constructCreateRole(another_role,
+                                                             role_permissions2),
+                  true));
+      CHECK_SUCCESSFUL_RESULT(
+          execute(*mock_command_factory->constructAppendRole(account_id,
+                                                             another_role)));
+      auto roles = sql_query->getAccountRoles(account_id);
+      ASSERT_TRUE(roles);
+      ASSERT_TRUE(std::find(roles->begin(), roles->end(), another_role)
+                  != roles->end());
     }
 
     class CreateAsset : public CommandExecutorTest {
@@ -743,9 +610,9 @@ namespace iroha {
                   true));
       CHECK_SUCCESSFUL_RESULT(execute(
           *mock_command_factory->constructCreateAsset("coin", domain_id, 1)));
-      auto ass = sql_query->getAsset(asset_id);
-      ASSERT_TRUE(ass);
-      ASSERT_EQ(asset_id, ass.get()->assetId());
+      auto asset = sql_query->getAsset(asset_id);
+      ASSERT_TRUE(asset);
+      ASSERT_EQ(asset_id, asset.get()->assetId());
     }
 
     /**
@@ -765,8 +632,8 @@ namespace iroha {
                   true));
       auto cmd_result = execute(
           *mock_command_factory->constructCreateAsset("coin", domain_id, 1));
-      auto ass = sql_query->getAsset(asset_id);
-      ASSERT_FALSE(ass);
+      auto asset = sql_query->getAsset(asset_id);
+      ASSERT_FALSE(asset);
 
       std::vector<std::string> query_args{domain_id, "coin", "1"};
       CHECK_ERROR_CODE_AND_MESSAGE(cmd_result, 2, query_args);
@@ -822,6 +689,29 @@ namespace iroha {
       CHECK_ERROR_CODE_AND_MESSAGE(cmd_result, 4, query_args);
     }
 
+    /**
+     * @given command, root permission
+     * @when trying to create asset
+     * @then asset is created
+     */
+    TEST_F(CreateAsset, ValidWithRoot) {
+      role_permissions.set(shared_model::interface::permissions::Role::kRoot);
+      CHECK_SUCCESSFUL_RESULT(execute(
+          *mock_command_factory->constructCreateRole(role, role_permissions),
+          true));
+      CHECK_SUCCESSFUL_RESULT(execute(
+          *mock_command_factory->constructCreateDomain(domain_id, role), true));
+      CHECK_SUCCESSFUL_RESULT(
+          execute(*mock_command_factory->constructCreateAccount(
+                      name, domain_id, *pubkey),
+                  true));
+      CHECK_SUCCESSFUL_RESULT(execute(
+          *mock_command_factory->constructCreateAsset("coin", domain_id, 1)));
+      auto asset = sql_query->getAsset(asset_id);
+      ASSERT_TRUE(asset);
+      ASSERT_EQ(asset_id, asset.get()->assetId());
+    }
+
     class CreateDomain : public CommandExecutorTest {
      public:
       void SetUp() override {
@@ -870,7 +760,7 @@ namespace iroha {
      * @then domain is not created
      */
     TEST_F(CreateDomain, NameNotUnique) {
-      addAllPerms();
+      addAllPermsWithoutRoot();
       CHECK_SUCCESSFUL_RESULT(execute(
           *mock_command_factory->constructCreateDomain(domain2_id, role)));
       auto cmd_result = execute(
@@ -886,12 +776,26 @@ namespace iroha {
      * @then domain is not created
      */
     TEST_F(CreateDomain, NoDefaultRole) {
-      addAllPerms();
+      addAllPermsWithoutRoot();
       auto cmd_result = execute(*mock_command_factory->constructCreateDomain(
           domain2_id, another_role));
 
       std::vector<std::string> query_args{domain2_id, another_role};
       CHECK_ERROR_CODE_AND_MESSAGE(cmd_result, 4, query_args);
+    }
+
+    /**
+     * @given command, root permission
+     * @when trying to create domain
+     * @then domain is created
+     */
+    TEST_F(CreateDomain, ValidWithRoot) {
+      addOnePerm(shared_model::interface::permissions::Role::kRoot);
+      CHECK_SUCCESSFUL_RESULT(execute(
+          *mock_command_factory->constructCreateDomain(domain2_id, role)));
+      auto dom = sql_query->getDomain(domain2_id);
+      ASSERT_TRUE(dom);
+      ASSERT_EQ(dom.get()->domainId(), domain2_id);
     }
 
     class CreateRole : public CommandExecutorTest {
@@ -945,7 +849,7 @@ namespace iroha {
      * @then role is not created
      */
     TEST_F(CreateRole, NameNotUnique) {
-      addAllPerms();
+      addAllPermsWithoutRoot();
       CHECK_SUCCESSFUL_RESULT(
           execute(*mock_command_factory->constructCreateRole(
               another_role, role_permissions)));
@@ -955,6 +859,21 @@ namespace iroha {
       std::vector<std::string> query_args{another_role,
                                           role_permissions.toBitstring()};
       CHECK_ERROR_CODE_AND_MESSAGE(cmd_result, 3, query_args);
+    }
+
+    /**
+     * @given command, root permission
+     * @when trying to create role
+     * @then role is created
+     */
+    TEST_F(CreateRole, ValidWithRoot) {
+      addOnePerm(shared_model::interface::permissions::Role::kRoot);
+      CHECK_SUCCESSFUL_RESULT(
+          execute(*mock_command_factory->constructCreateRole(
+              another_role, role_permissions)));
+      auto rl = sql_query->getRolePermissions(role);
+      ASSERT_TRUE(rl);
+      ASSERT_EQ(rl.get(), role_permissions);
     }
 
     class DetachRole : public CommandExecutorTest {
@@ -1016,7 +935,7 @@ namespace iroha {
      * @then correspondent error code is returned
      */
     TEST_F(DetachRole, NoAccount) {
-      addAllPerms();
+      addAllPermsWithoutRoot();
       auto cmd_result = execute(*mock_command_factory->constructDetachRole(
           "doge@noaccount", another_role));
 
@@ -1030,7 +949,7 @@ namespace iroha {
      * @then correspondent error code is returned
      */
     TEST_F(DetachRole, NoSuchRoleInAccount) {
-      addAllPerms();
+      addAllPermsWithoutRoot();
       CHECK_SUCCESSFUL_RESULT(
           execute(*mock_command_factory->constructDetachRole(account_id,
                                                              another_role)));
@@ -1047,12 +966,28 @@ namespace iroha {
      * @then correspondent error code is returned
      */
     TEST_F(DetachRole, NoRole) {
-      addAllPerms();
+      addAllPermsWithoutRoot();
       auto cmd_result = execute(*mock_command_factory->constructDetachRole(
           account_id, "not_existing_role"));
 
       std::vector<std::string> query_args{account_id, "not_existing_role"};
       CHECK_ERROR_CODE_AND_MESSAGE(cmd_result, 5, query_args);
+    }
+
+    /**
+     * @given command, root permission
+     * @when trying to detach role
+     * @then role is detached
+     */
+    TEST_F(DetachRole, ValidWithRoot) {
+      addOnePerm(shared_model::interface::permissions::Role::kRoot);
+      CHECK_SUCCESSFUL_RESULT(
+          execute(*mock_command_factory->constructDetachRole(account_id,
+                                                             another_role)));
+      auto roles = sql_query->getAccountRoles(account_id);
+      ASSERT_TRUE(roles);
+      ASSERT_TRUE(std::find(roles->begin(), roles->end(), another_role)
+                  == roles->end());
     }
 
     class GrantPermission : public CommandExecutorTest {
@@ -1108,7 +1043,7 @@ namespace iroha {
      * @then corresponding error code is returned
      */
     TEST_F(GrantPermission, NoAccount) {
-      addAllPerms();
+      addAllPermsWithoutRoot();
       auto perm = shared_model::interface::permissions::Grantable::kSetMyQuorum;
       auto cmd_result = execute(*mock_command_factory->constructGrantPermission(
           "doge@noaccount", perm));
@@ -1116,6 +1051,21 @@ namespace iroha {
       std::vector<std::string> query_args{"doge@noaccount",
                                           perm_converter->toString(perm)};
       CHECK_ERROR_CODE_AND_MESSAGE(cmd_result, 3, query_args);
+    }
+
+    /**
+     * @given command, root permission
+     * @when trying to grant permission
+     * @then permission is granted
+     */
+    TEST_F(GrantPermission, ValidWithRoot) {
+      addOnePerm(shared_model::interface::permissions::Role::kRoot);
+      auto perm = shared_model::interface::permissions::Grantable::kSetMyQuorum;
+      CHECK_SUCCESSFUL_RESULT(execute(
+          *mock_command_factory->constructGrantPermission(account_id, perm)));
+      auto has_perm = sql_query->hasAccountGrantablePermission(
+          account_id, account_id, perm);
+      ASSERT_TRUE(has_perm);
     }
 
     class RemoveSignatory : public CommandExecutorTest {
@@ -1220,7 +1170,7 @@ namespace iroha {
      * @then corresponding error code is returned
      */
     TEST_F(RemoveSignatory, NoAccount) {
-      addAllPerms();
+      addAllPermsWithoutRoot();
       shared_model::interface::types::PubkeyType pk(std::string('5', 32));
       CHECK_SUCCESSFUL_RESULT(execute(
           *mock_command_factory->constructAddSignatory(pk, account_id), true));
@@ -1238,7 +1188,7 @@ namespace iroha {
      * @then corresponding error code is returned
      */
     TEST_F(RemoveSignatory, NoSuchSignatory) {
-      addAllPerms();
+      addAllPermsWithoutRoot();
       shared_model::interface::types::PubkeyType pk(std::string('5', 32));
       CHECK_SUCCESSFUL_RESULT(execute(
           *mock_command_factory->constructAddSignatory(pk, account_id), true));
@@ -1265,7 +1215,7 @@ namespace iroha {
      * @then signatory is not removed
      */
     TEST_F(RemoveSignatory, SignatoriesLessThanQuorum) {
-      addAllPerms();
+      addAllPermsWithoutRoot();
       shared_model::interface::types::PubkeyType pk(std::string('5', 32));
       CHECK_SUCCESSFUL_RESULT(execute(
           *mock_command_factory->constructAddSignatory(pk, account_id), true));
@@ -1277,6 +1227,27 @@ namespace iroha {
 
       std::vector<std::string> query_args{account_id, pk.hex()};
       CHECK_ERROR_CODE_AND_MESSAGE(cmd_result, 5, query_args);
+    }
+
+    /**
+     * @given command, root permission
+     * @when trying to remove signatory
+     * @then signatory is successfully removed
+     */
+    TEST_F(RemoveSignatory, ValidWithRoot) {
+      addOnePerm(shared_model::interface::permissions::Role::kRoot);
+      shared_model::interface::types::PubkeyType pk(std::string('5', 32));
+      CHECK_SUCCESSFUL_RESULT(execute(
+          *mock_command_factory->constructAddSignatory(pk, account_id), true));
+      CHECK_SUCCESSFUL_RESULT(
+          execute(*mock_command_factory->constructRemoveSignatory(account_id,
+                                                                  *pubkey)));
+      auto signatories = wsv_query->getSignatories(account_id);
+      ASSERT_TRUE(signatories);
+      ASSERT_TRUE(std::find(signatories->begin(), signatories->end(), *pubkey)
+                  == signatories->end());
+      ASSERT_TRUE(std::find(signatories->begin(), signatories->end(), pk)
+                  != signatories->end());
     }
 
     class RevokePermission : public CommandExecutorTest {
@@ -1335,115 +1306,6 @@ namespace iroha {
       std::vector<std::string> query_args{account_id,
                                           perm_converter->toString(perm)};
       CHECK_ERROR_CODE_AND_MESSAGE(cmd_result, 2, query_args);
-    }
-
-    class SetAccountDetail : public CommandExecutorTest {
-     public:
-      void SetUp() override {
-        CommandExecutorTest::SetUp();
-        createDefaultRole();
-        createDefaultDomain();
-        createDefaultAccount();
-        account2_id = "id2@" + domain_id;
-        CHECK_SUCCESSFUL_RESULT(
-            execute(*mock_command_factory->constructCreateAccount(
-                        "id2",
-                        domain_id,
-                        shared_model::interface::types::PubkeyType(
-                            std::string('2', 32))),
-                    true));
-      }
-      shared_model::interface::types::AccountIdType account2_id;
-    };
-
-    /**
-     * @given command
-     * @when trying to set kv
-     * @then kv is set
-     */
-    TEST_F(SetAccountDetail, Valid) {
-      CHECK_SUCCESSFUL_RESULT(
-          execute(*mock_command_factory->constructSetAccountDetail(
-              account_id, "key", "value")));
-      auto kv = sql_query->getAccountDetail(account_id);
-      ASSERT_TRUE(kv);
-      ASSERT_EQ(kv.get(), "{\"id@domain\": {\"key\": \"value\"}}");
-    }
-
-    /**
-     * @given command
-     * @when trying to set kv when has grantable permission
-     * @then kv is set
-     */
-    TEST_F(SetAccountDetail, ValidGrantablePerm) {
-      auto perm =
-          shared_model::interface::permissions::Grantable::kSetMyAccountDetail;
-      CHECK_SUCCESSFUL_RESULT(execute(
-          *mock_command_factory->constructGrantPermission(account_id, perm),
-          true,
-          "id2@domain"));
-      CHECK_SUCCESSFUL_RESULT(
-          execute(*mock_command_factory->constructSetAccountDetail(
-                      account2_id, "key", "value"),
-                  false,
-                  account_id));
-      auto kv = sql_query->getAccountDetail(account2_id);
-      ASSERT_TRUE(kv);
-      ASSERT_EQ(kv.get(), "{\"id@domain\": {\"key\": \"value\"}}");
-    }
-
-    /**
-     * @given command
-     * @when trying to set kv when has role permission
-     * @then kv is set
-     */
-    TEST_F(SetAccountDetail, ValidRolePerm) {
-      addAllPerms();
-      CHECK_SUCCESSFUL_RESULT(
-          execute(*mock_command_factory->constructSetAccountDetail(
-                      account2_id, "key", "value"),
-                  false,
-                  account_id));
-      auto kv = sql_query->getAccountDetail(account2_id);
-      ASSERT_TRUE(kv);
-      ASSERT_EQ(kv.get(), "{\"id@domain\": {\"key\": \"value\"}}");
-    }
-
-    /**
-     * @given command
-     * @when trying to set kv while having no permissions
-     * @then corresponding error code is returned
-     */
-    TEST_F(SetAccountDetail, NoPerms) {
-      auto cmd_result =
-          execute(*mock_command_factory->constructSetAccountDetail(
-                      account2_id, "key", "value"),
-                  false,
-                  account_id);
-
-      std::vector<std::string> query_args{account2_id, "key", "value"};
-      CHECK_ERROR_CODE_AND_MESSAGE(cmd_result, 2, query_args);
-
-      auto kv = sql_query->getAccountDetail(account2_id);
-      ASSERT_TRUE(kv);
-      ASSERT_EQ(kv.get(), "{}");
-    }
-
-    /**
-     * @given command
-     * @when trying to set kv to non-existing account
-     * @then corresponding error code is returned
-     */
-    TEST_F(SetAccountDetail, NoAccount) {
-      addAllPerms();
-      auto cmd_result =
-          execute(*mock_command_factory->constructSetAccountDetail(
-                      "doge@noaccount", "key", "value"),
-                  false,
-                  account_id);
-
-      std::vector<std::string> query_args{"doge@noaccount", "key", "value"};
-      CHECK_ERROR_CODE_AND_MESSAGE(cmd_result, 3, query_args);
     }
 
     class SetQuorum : public CommandExecutorTest {
@@ -1520,7 +1382,7 @@ namespace iroha {
      * @then quorum is not set
      */
     TEST_F(SetQuorum, LessSignatoriesThanNewQuorum) {
-      addAllPerms();
+      addAllPermsWithoutRoot();
       shared_model::interface::types::PubkeyType pk(std::string('5', 32));
       CHECK_SUCCESSFUL_RESULT(execute(
           *mock_command_factory->constructAddSignatory(pk, account_id), true));
@@ -1534,6 +1396,18 @@ namespace iroha {
       CHECK_ERROR_CODE_AND_MESSAGE(cmd_result, 5, query_args);
     }
 
+    /**
+     * @given command, root permission
+     * @when trying to set quorum
+     * @then quorum is set
+     */
+    TEST_F(SetQuorum, ValidWithRoot) {
+      addOnePerm(shared_model::interface::permissions::Role::kRoot);
+
+      CHECK_SUCCESSFUL_RESULT(
+          execute(*mock_command_factory->constructSetQuorum(account_id, 2)));
+    }
+
     class SubtractAccountAssetTest : public CommandExecutorTest {
       void SetUp() override {
         CommandExecutorTest::SetUp();
@@ -1543,16 +1417,6 @@ namespace iroha {
       }
 
      public:
-      /**
-       * Add default asset and check that it is done
-       */
-      void addAsset(const shared_model::interface::types::DomainIdType
-                        &domain_id = "domain") {
-        CHECK_SUCCESSFUL_RESULT(execute(
-            *mock_command_factory->constructCreateAsset("coin", domain_id, 1),
-            true));
-      }
-
       shared_model::interface::types::AssetIdType asset_id =
           "coin#" + domain_id;
     };
@@ -1663,7 +1527,7 @@ namespace iroha {
       CHECK_SUCCESSFUL_RESULT(execute(
           *mock_command_factory->constructCreateDomain(domain2_id, role),
           true));
-      addAsset(domain2_id);
+      addAsset("coin", domain2_id, 1);
       addOnePerm(
           shared_model::interface::permissions::Role::kSubtractDomainAssetQty);
 
@@ -1695,7 +1559,7 @@ namespace iroha {
      * @then account asset fails to be subtracted
      */
     TEST_F(SubtractAccountAssetTest, NoAsset) {
-      addAllPerms();
+      addAllPermsWithoutRoot();
       auto cmd_result =
           execute(*mock_command_factory->constructSubtractAssetQuantity(
               asset_id, asset_amount_one_zero));
@@ -1711,7 +1575,7 @@ namespace iroha {
      * @then account asset fails to be added
      */
     TEST_F(SubtractAccountAssetTest, InvalidPrecision) {
-      addAllPerms();
+      addAllPermsWithoutRoot();
       addAsset();
       auto cmd_result =
           execute(*mock_command_factory->constructSubtractAssetQuantity(
@@ -1727,7 +1591,7 @@ namespace iroha {
      * @then account asset fails to be subtracted
      */
     TEST_F(SubtractAccountAssetTest, NotEnoughAsset) {
-      addAllPerms();
+      addAllPermsWithoutRoot();
       addAsset();
       CHECK_SUCCESSFUL_RESULT(
           execute(*mock_command_factory->constructAddAssetQuantity(
@@ -1739,6 +1603,36 @@ namespace iroha {
 
       std::vector<std::string> query_args{account_id, asset_id, "2.0", "1"};
       CHECK_ERROR_CODE_AND_MESSAGE(cmd_result, 4, query_args);
+    }
+
+    /**
+     * @given command, root permission
+     * @when trying to subtract account asset
+     * @then account asset is successfully subtracted
+     */
+    TEST_F(SubtractAccountAssetTest, ValidWithRoot) {
+      addOnePerm(shared_model::interface::permissions::Role::kRoot);
+      addAsset();
+      CHECK_SUCCESSFUL_RESULT(
+          execute(*mock_command_factory->constructAddAssetQuantity(
+                      asset_id, asset_amount_one_zero),
+                  true));
+      auto account_asset = sql_query->getAccountAsset(account_id, asset_id);
+      ASSERT_TRUE(account_asset);
+      ASSERT_EQ(asset_amount_one_zero, account_asset.get()->balance());
+      CHECK_SUCCESSFUL_RESULT(
+          execute(*mock_command_factory->constructAddAssetQuantity(
+                      asset_id, asset_amount_one_zero),
+                  true));
+      account_asset = sql_query->getAccountAsset(account_id, asset_id);
+      ASSERT_TRUE(account_asset);
+      ASSERT_EQ("2.0", account_asset.get()->balance().toStringRepr());
+      CHECK_SUCCESSFUL_RESULT(
+          execute(*mock_command_factory->constructSubtractAssetQuantity(
+              asset_id, asset_amount_one_zero)));
+      account_asset = sql_query->getAccountAsset(account_id, asset_id);
+      ASSERT_TRUE(account_asset);
+      ASSERT_EQ(asset_amount_one_zero, account_asset.get()->balance());
     }
 
     class TransferAccountAssetTest : public CommandExecutorTest {
@@ -1757,13 +1651,19 @@ namespace iroha {
       }
 
      public:
-      /**
-       * Add default asset and check that it is done
-       */
-      void addAsset() {
-        CHECK_SUCCESSFUL_RESULT(execute(
-            *mock_command_factory->constructCreateAsset("coin", domain_id, 1),
-            true));
+      using Amount = shared_model::interface::Amount;
+
+      void transferAndCheckError(const std::string &from,
+                                 const std::string &to,
+                                 const std::string &quantity,
+                                 CommandError::ErrorCodeType code) {
+        static const std::string tx_description("some description");
+        auto cmd = mock_command_factory->constructTransferAsset(
+            from, to, asset_id, tx_description, Amount{quantity});
+        auto result = execute(*cmd, true);
+        std::vector<std::string> query_args{
+            from, to, asset_id, quantity, quantity};
+        CHECK_ERROR_CODE_AND_MESSAGE(result, code, query_args);
       }
 
       shared_model::interface::types::AssetIdType asset_id =
@@ -1815,7 +1715,7 @@ namespace iroha {
      * @then account asset is successfully transferred
      */
     TEST_F(TransferAccountAssetTest, ValidGrantablePerms) {
-      addAllPerms(account2_id, "all2");
+      addAllPermsWithoutRoot(account2_id, "all2");
       addAsset();
       auto perm =
           shared_model::interface::permissions::Grantable::kTransferMyAssets;
@@ -1876,9 +1776,13 @@ namespace iroha {
      * @then account asset fails to be transferred
      */
     TEST_F(TransferAccountAssetTest, NoAccount) {
-      addAllPerms();
-      addAllPerms(account2_id, "all2");
+      addAllPermsWithoutRoot();
+      addAllPermsWithoutRoot(account2_id, "all2");
       addAsset();
+      CHECK_SUCCESSFUL_RESULT(
+          execute(*mock_command_factory->constructAddAssetQuantity(
+                      asset_id, shared_model::interface::Amount{"0.1"}),
+                  true));
       CHECK_SUCCESSFUL_RESULT(
           execute(*mock_command_factory->constructAddAssetQuantity(
                       asset_id, asset_amount_one_zero),
@@ -1926,8 +1830,8 @@ namespace iroha {
      * @then account asset fails to be transferred
      */
     TEST_F(TransferAccountAssetTest, NoAsset) {
-      addAllPerms();
-      addAllPerms(account2_id, "all2");
+      addAllPermsWithoutRoot();
+      addAllPermsWithoutRoot(account2_id, "all2");
       auto cmd_result = execute(*mock_command_factory->constructTransferAsset(
           account_id, account2_id, asset_id, "desc", asset_amount_one_zero));
 
@@ -1941,12 +1845,59 @@ namespace iroha {
 
     /**
      * @given command
+     * @when trying to transfer asset that the transmitter does not posess
+     * @then account asset fails to be transferred
+     */
+    TEST_F(TransferAccountAssetTest, NoSrcAsset) {
+      addAllPermsWithoutRoot();
+      addAllPermsWithoutRoot(account2_id, "all2");
+      addAsset();
+      auto cmd_result = execute(*mock_command_factory->constructTransferAsset(
+          account_id, account2_id, asset_id, "desc", asset_amount_one_zero));
+
+      std::vector<std::string> query_args{account_id,
+                                          account2_id,
+                                          asset_id,
+                                          asset_amount_one_zero.toStringRepr(),
+                                          "1"};
+      CHECK_ERROR_CODE_AND_MESSAGE(cmd_result, 6, query_args);
+    }
+
+    /**
+     * @given command
+     * @when transfer an asset which the receiver already has
+     * @then account asset is successfully transferred
+     */
+    TEST_F(TransferAccountAssetTest, DestHasAsset) {
+      addAllPermsWithoutRoot();
+      addAllPermsWithoutRoot(account2_id, "all2");
+      addAsset();
+      CHECK_SUCCESSFUL_RESULT(
+          execute(*mock_command_factory->constructAddAssetQuantity(
+                      asset_id, asset_amount_one_zero),
+                  true));
+      CHECK_SUCCESSFUL_RESULT(
+          execute(*mock_command_factory->constructAddAssetQuantity(
+                      asset_id, shared_model::interface::Amount{"0.1"}),
+                  true,
+                  account2_id));
+      auto cmd_result = execute(*mock_command_factory->constructTransferAsset(
+          account_id, account2_id, asset_id, "desc", asset_amount_one_zero));
+
+      auto account_asset = sql_query->getAccountAsset(account2_id, asset_id);
+      ASSERT_TRUE(account_asset);
+      ASSERT_EQ(account_asset.get()->balance(),
+                shared_model::interface::Amount{"1.1"});
+    }
+
+    /**
+     * @given command
      * @when trying to transfer account asset, but has insufficient amount of it
      * @then account asset fails to be transferred
      */
     TEST_F(TransferAccountAssetTest, Overdraft) {
-      addAllPerms();
-      addAllPerms(account2_id, "all2");
+      addAllPermsWithoutRoot();
+      addAllPermsWithoutRoot(account2_id, "all2");
       addAsset();
       CHECK_SUCCESSFUL_RESULT(
           execute(*mock_command_factory->constructAddAssetQuantity(
@@ -1965,35 +1916,378 @@ namespace iroha {
     }
 
     /**
-     * @given command
-     * @when trying to transfer account asset, but final value overflows the
-     * destination's asset value
-     * @then account asset fails to be transferred
+     * @given two users with all required permissions, one having the maximum
+     * allowed quantity of an asset with precision 1
+     * @when execute a tx from another user with TransferAsset command for that
+     * asset with the smallest possible quantity and then with a lower one
+     * @then the last 2 transactions are not committed
      */
-    TEST_F(TransferAccountAssetTest, OverflowDestination) {
-      addAllPerms();
-      addAllPerms(account2_id, "all2");
+    TEST_F(TransferAccountAssetTest, DestOverflowPrecision1) {
+      addAllPermsWithoutRoot();
+      addAllPermsWithoutRoot(account2_id, "all2");
       addAsset();
       CHECK_SUCCESSFUL_RESULT(
           execute(*mock_command_factory->constructAddAssetQuantity(
-                      asset_id, uint256_halfmax),
+                      asset_id, Amount{"10"}),
                   true));
       CHECK_SUCCESSFUL_RESULT(
           execute(*mock_command_factory->constructAddAssetQuantity(
-                      asset_id, uint256_halfmax),
+                      asset_id, kAmountPrec1Max),
                   false,
                   account2_id));
-      auto cmd_result = execute(
-          *mock_command_factory->constructTransferAsset(
-              account_id, account2_id, asset_id, "desc", uint256_halfmax),
-          true);
 
-      std::vector<std::string> query_args{account_id,
-                                          account2_id,
-                                          asset_id,
-                                          uint256_halfmax.toStringRepr(),
-                                          "1"};
-      CHECK_ERROR_CODE_AND_MESSAGE(cmd_result, 7, query_args);
+      transferAndCheckError(account_id, account2_id, "0.1", 7);
+      transferAndCheckError(account_id, account2_id, "1", 7);
+    }
+
+    /**
+     * @given two users with all required permissions, one having the maximum
+     * allowed quantity of an asset with precision 2
+     * @when execute a tx from another user with TransferAsset command for that
+     * asset with the smallest possible quantity and then with a lower one
+     * @then last 2 transactions are not committed
+     */
+    TEST_F(TransferAccountAssetTest, DestOverflowPrecision2) {
+      addAllPermsWithoutRoot();
+      addAllPermsWithoutRoot(account2_id, "all2");
+      addAsset("coin", domain_id, 2);
+      CHECK_SUCCESSFUL_RESULT(
+          execute(*mock_command_factory->constructAddAssetQuantity(
+                      asset_id, Amount{"1.0"}),
+                  true));
+      CHECK_SUCCESSFUL_RESULT(
+          execute(*mock_command_factory->constructAddAssetQuantity(
+                      asset_id, kAmountPrec2Max),
+                  false,
+                  account2_id));
+
+      transferAndCheckError(account_id, account2_id, "0.01", 7);
+      transferAndCheckError(account_id, account2_id, "0.1", 7);
+    }
+
+    /**
+     * @given command, root permission
+     * @when trying to add transfer asset
+     * @then account asset is successfully transferred
+     */
+    TEST_F(TransferAccountAssetTest, ValidWithRoot) {
+      addOnePerm(shared_model::interface::permissions::Role::kRoot);
+      addAllPermsWithoutRoot(account2_id, "all2");
+      addAsset();
+      CHECK_SUCCESSFUL_RESULT(
+          execute(*mock_command_factory->constructAddAssetQuantity(
+                      asset_id, asset_amount_one_zero),
+                  true));
+      auto account_asset = sql_query->getAccountAsset(account_id, asset_id);
+      ASSERT_TRUE(account_asset);
+      ASSERT_EQ(asset_amount_one_zero, account_asset.get()->balance());
+      CHECK_SUCCESSFUL_RESULT(
+          execute(*mock_command_factory->constructAddAssetQuantity(
+                      asset_id, asset_amount_one_zero),
+                  true));
+      account_asset = sql_query->getAccountAsset(account_id, asset_id);
+      ASSERT_TRUE(account_asset);
+      ASSERT_EQ("2.0", account_asset.get()->balance().toStringRepr());
+      CHECK_SUCCESSFUL_RESULT(
+          execute(*mock_command_factory->constructTransferAsset(
+              account_id,
+              account2_id,
+              asset_id,
+              "desc",
+              asset_amount_one_zero)));
+      account_asset = sql_query->getAccountAsset(account_id, asset_id);
+      ASSERT_TRUE(account_asset);
+      ASSERT_EQ(asset_amount_one_zero, account_asset.get()->balance());
+      account_asset = sql_query->getAccountAsset(account2_id, asset_id);
+      ASSERT_TRUE(account_asset);
+      ASSERT_EQ(asset_amount_one_zero, account_asset.get()->balance());
+    }
+
+    /**
+     * @given command
+     * @when trying to add transfer asset to account with root permission
+     * @then account asset is successfully transferred
+     */
+    TEST_F(TransferAccountAssetTest, DestWithRoot) {
+      addAllPermsWithoutRoot();
+      addOnePerm(shared_model::interface::permissions::Role::kRoot,
+                 account2_id,
+                 "all2");
+      addAsset();
+      CHECK_SUCCESSFUL_RESULT(
+          execute(*mock_command_factory->constructAddAssetQuantity(
+                      asset_id, asset_amount_one_zero),
+                  true));
+      auto account_asset = sql_query->getAccountAsset(account_id, asset_id);
+      ASSERT_TRUE(account_asset);
+      ASSERT_EQ(asset_amount_one_zero, account_asset.get()->balance());
+      CHECK_SUCCESSFUL_RESULT(
+          execute(*mock_command_factory->constructAddAssetQuantity(
+                      asset_id, asset_amount_one_zero),
+                  true));
+      account_asset = sql_query->getAccountAsset(account_id, asset_id);
+      ASSERT_TRUE(account_asset);
+      ASSERT_EQ("2.0", account_asset.get()->balance().toStringRepr());
+      CHECK_SUCCESSFUL_RESULT(
+          execute(*mock_command_factory->constructTransferAsset(
+              account_id,
+              account2_id,
+              asset_id,
+              "desc",
+              asset_amount_one_zero)));
+      account_asset = sql_query->getAccountAsset(account_id, asset_id);
+      ASSERT_TRUE(account_asset);
+      ASSERT_EQ(asset_amount_one_zero, account_asset.get()->balance());
+      account_asset = sql_query->getAccountAsset(account2_id, asset_id);
+      ASSERT_TRUE(account_asset);
+      ASSERT_EQ(asset_amount_one_zero, account_asset.get()->balance());
+    }
+
+    class CompareAndSetAccountDetail : public CommandExecutorTest {
+     public:
+      void SetUp() override {
+        CommandExecutorTest::SetUp();
+        createDefaultRole();
+        createDefaultDomain();
+        createDefaultAccount();
+        account2_id = "id2@" + domain_id;
+        CHECK_SUCCESSFUL_RESULT(
+            execute(*mock_command_factory->constructCreateAccount(
+                        "id2",
+                        domain_id,
+                        shared_model::interface::types::PubkeyType(
+                            std::string('2', 32))),
+                    true));
+      }
+      shared_model::interface::types::AccountIdType account2_id;
+    };
+
+    /**
+     * @given command
+     * @when trying to set kv
+     * @then kv is set
+     */
+    TEST_F(CompareAndSetAccountDetail, Valid) {
+      addOnePerm(shared_model::interface::permissions::Role::kGetMyAccDetail);
+      CHECK_SUCCESSFUL_RESULT(
+          execute(*mock_command_factory->constructCompareAndSetAccountDetail(
+              account_id, "key", "value", boost::none)));
+      auto kv = sql_query->getAccountDetail(account_id);
+      ASSERT_TRUE(kv);
+      ASSERT_EQ(kv.get(), R"({"id@domain": {"key": "value"}})");
+    }
+
+    /**
+     * @given command
+     * @when trying to set kv when has grantable permission
+     * @then kv is set
+     */
+    TEST_F(CompareAndSetAccountDetail, ValidGrantablePerm) {
+      addOnePerm(
+          shared_model::interface::permissions::Role::kGetDomainAccDetail);
+      auto perm =
+          shared_model::interface::permissions::Grantable::kSetMyAccountDetail;
+      CHECK_SUCCESSFUL_RESULT(execute(
+          *mock_command_factory->constructGrantPermission(account_id, perm),
+          true,
+          account2_id));
+
+      CHECK_SUCCESSFUL_RESULT(
+          execute(*mock_command_factory->constructCompareAndSetAccountDetail(
+                      account2_id, "key", "value", boost::none),
+                  false,
+                  account_id));
+      auto kv = sql_query->getAccountDetail(account2_id);
+      ASSERT_TRUE(kv);
+      ASSERT_EQ(kv.get(), R"({"id@domain": {"key": "value"}})");
+    }
+
+    /**
+     * @given command
+     * @when trying to set kv when has role permission
+     * @then kv is set
+     */
+    TEST_F(CompareAndSetAccountDetail, ValidRolePerm) {
+      addAllPermsWithoutRoot();
+      CHECK_SUCCESSFUL_RESULT(
+          execute(*mock_command_factory->constructCompareAndSetAccountDetail(
+                      account2_id, "key", "value", boost::none),
+                  false,
+                  account_id));
+      auto kv = sql_query->getAccountDetail(account2_id);
+      ASSERT_TRUE(kv);
+      ASSERT_EQ(kv.get(), R"({"id@domain": {"key": "value"}})");
+    }
+
+    /**
+     * @given command
+     * @when trying to set kv while having no permissions
+     * @then corresponding error code is returned
+     */
+    TEST_F(CompareAndSetAccountDetail, NoPerms) {
+      auto cmd_result =
+          execute(*mock_command_factory->constructCompareAndSetAccountDetail(
+                      account2_id, "key", "value", boost::none),
+                  false,
+                  account_id);
+
+      std::vector<std::string> query_args{account2_id, "key", "value"};
+      CHECK_ERROR_CODE_AND_MESSAGE(cmd_result, 2, query_args);
+
+      auto kv = sql_query->getAccountDetail(account2_id);
+      ASSERT_TRUE(kv);
+      ASSERT_EQ(kv.get(), "{}");
+    }
+
+    /**
+     * @given command
+     * @when trying to set kv to non-existing account
+     * @then corresponding error code is returned
+     */
+    TEST_F(CompareAndSetAccountDetail, NoAccount) {
+      addAllPermsWithoutRoot();
+      auto cmd_result =
+          execute(*mock_command_factory->constructCompareAndSetAccountDetail(
+                      "doge@noaccount", "key", "value", boost::none),
+                  false,
+                  account_id);
+
+      std::vector<std::string> query_args{"doge@noaccount", "key", "value"};
+      CHECK_ERROR_CODE_AND_MESSAGE(cmd_result, 3, query_args);
+    }
+
+    /**
+     * @given command
+     * @when trying to set kv and then set kv1 with correct old value
+     * @then kv1 is set
+     */
+    TEST_F(CompareAndSetAccountDetail, ValidOldValue) {
+      addOnePerm(shared_model::interface::permissions::Role::kGetMyAccDetail);
+      CHECK_SUCCESSFUL_RESULT(
+          execute(*mock_command_factory->constructCompareAndSetAccountDetail(
+              account_id, "key", "value", boost::none)));
+
+      auto kv = sql_query->getAccountDetail(account_id);
+      ASSERT_TRUE(kv);
+      ASSERT_EQ(kv.get(), R"({"id@domain": {"key": "value"}})");
+
+      CHECK_SUCCESSFUL_RESULT(
+          execute(*mock_command_factory->constructCompareAndSetAccountDetail(
+              account_id,
+              "key",
+              "value1",
+              boost::optional<
+                  shared_model::interface::types::AccountDetailValueType>(
+                  "value"))));
+      auto kv1 = sql_query->getAccountDetail(account_id);
+      ASSERT_TRUE(kv1);
+      ASSERT_EQ(kv1.get(), R"({"id@domain": {"key": "value1"}})");
+    }
+
+    /**
+     * @given command
+     * @when trying to set kv and then set kv1 with incorrect old value
+     * @then corresponding error code is returned
+     */
+    TEST_F(CompareAndSetAccountDetail, InvalidOldValue) {
+      addOnePerm(shared_model::interface::permissions::Role::kGetMyAccDetail);
+      CHECK_SUCCESSFUL_RESULT(
+          execute(*mock_command_factory->constructCompareAndSetAccountDetail(
+              account_id, "key", "value", boost::none)));
+
+      auto kv = sql_query->getAccountDetail(account_id);
+      ASSERT_TRUE(kv);
+      ASSERT_EQ(kv.get(), R"({"id@domain": {"key": "value"}})");
+
+      auto cmd_result =
+          execute(*mock_command_factory->constructCompareAndSetAccountDetail(
+              account_id,
+              "key",
+              "value1",
+              boost::optional<
+                  shared_model::interface::types::AccountDetailValueType>(
+                  "oldValue")));
+
+      std::vector<std::string> query_args{
+          account_id, "key", "value1", "oldValue"};
+      CHECK_ERROR_CODE_AND_MESSAGE(cmd_result, 4, query_args);
+    }
+
+    /**
+     * @given Two commands
+     * @when trying to set kv and then set k1v1
+     * @then kv and k1v1 are set
+     */
+    TEST_F(CompareAndSetAccountDetail, DifferentKeys) {
+      addOnePerm(shared_model::interface::permissions::Role::kGetMyAccDetail);
+      CHECK_SUCCESSFUL_RESULT(
+          execute(*mock_command_factory->constructCompareAndSetAccountDetail(
+              account_id, "key", "value", boost::none)));
+
+      CHECK_SUCCESSFUL_RESULT(
+          execute(*mock_command_factory->constructCompareAndSetAccountDetail(
+              account_id, "key1", "value1", boost::none)));
+
+      auto ad = sql_query->getAccountDetail(account_id);
+      ASSERT_TRUE(ad);
+      ASSERT_EQ(ad.get(),
+                R"({"id@domain": {"key": "value", "key1": "value1"}})");
+    }
+
+    /**
+     * @given commands
+     * @when trying to set kv without oldValue where v is empty string
+     * @then corresponding error code is returned
+     */
+    TEST_F(CompareAndSetAccountDetail, EmptyDetail) {
+      addOnePerm(shared_model::interface::permissions::Role::kGetMyAccDetail);
+      CHECK_SUCCESSFUL_RESULT(
+          execute(*mock_command_factory->constructCompareAndSetAccountDetail(
+              account_id, "key", "", boost::none)));
+
+      auto cmd_result =
+          execute(*mock_command_factory->constructCompareAndSetAccountDetail(
+              account_id, "key", "value", boost::none));
+
+      std::vector<std::string> query_args{account_id, "key", "value"};
+      CHECK_ERROR_CODE_AND_MESSAGE(cmd_result, 4, query_args);
+    }
+
+    /**
+     * @given commands
+     * @when trying to set new kv with not empty oldValue
+     * @then corresponding error code is returned
+     */
+    TEST_F(CompareAndSetAccountDetail, NewDetailWithNotEmptyOldValue) {
+      addOnePerm(shared_model::interface::permissions::Role::kGetMyAccDetail);
+
+      auto cmd_result =
+          execute(*mock_command_factory->constructCompareAndSetAccountDetail(
+              account_id,
+              "key",
+              "value",
+              boost::optional<
+                  shared_model::interface::types::AccountDetailValueType>(
+                  "notEmptyOldValue")));
+
+      std::vector<std::string> query_args{
+          account_id, "key", "value", "notEmptyOldValue"};
+      CHECK_ERROR_CODE_AND_MESSAGE(cmd_result, 4, query_args);
+    }
+
+    /**
+     * @given command, root permission
+     * @when trying to set kv
+     * @then kv is set
+     */
+    TEST_F(CompareAndSetAccountDetail, ValidWithRoot) {
+      addOnePerm(shared_model::interface::permissions::Role::kRoot);
+      CHECK_SUCCESSFUL_RESULT(
+          execute(*mock_command_factory->constructCompareAndSetAccountDetail(
+              account_id, "key", "value", boost::none)));
+      auto kv = sql_query->getAccountDetail(account_id);
+      ASSERT_TRUE(kv);
+      ASSERT_EQ(kv.get(), R"({"id@domain": {"key": "value"}})");
     }
 
   }  // namespace ametsuchi

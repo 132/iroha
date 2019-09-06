@@ -95,31 +95,31 @@ namespace iroha {
 
         consensus::Round current_round = latest_commit.round;
 
-        auto on_blocks = [this, current_hashes, &current_round](
-                             const auto &commit) {
-          current_round = ordering::nextCommitRound(current_round);
-          current_peers_ = commit.ledger_state->ledger_peers;
+        auto on_blocks =
+            [this, current_hashes, &current_round](const auto &commit) {
+              current_round = ordering::nextCommitRound(current_round);
+              current_peers_ = commit.ledger_state->ledger_peers;
 
-          // generate permutation of peers list from corresponding round
-          // hash
-          auto generate_permutation = [&](auto round) {
-            auto &hash = std::get<round()>(current_hashes);
-            log_->debug("Using hash: {}", hash.toString());
-            auto &permutation = permutations_[round()];
+              // generate permutation of peers list from corresponding round
+              // hash
+              auto generate_permutation = [&](auto round) {
+                auto &hash = std::get<round()>(current_hashes);
+                log_->debug("Using hash: {}", hash.toString());
+                auto &permutation = permutations_[round()];
 
-            std::seed_seq seed(hash.blob().begin(), hash.blob().end());
-            gen_.seed(seed);
+                std::seed_seq seed(hash.blob().begin(), hash.blob().end());
+                gen_.seed(seed);
 
-            permutation.resize(current_peers_.size());
-            std::iota(permutation.begin(), permutation.end(), 0);
+                permutation.resize(current_peers_.size());
+                std::iota(permutation.begin(), permutation.end(), 0);
 
-            std::shuffle(permutation.begin(), permutation.end(), gen_);
-          };
+                std::shuffle(permutation.begin(), permutation.end(), gen_);
+              };
 
-          generate_permutation(RoundTypeConstant<kCurrentRound>{});
-          generate_permutation(RoundTypeConstant<kNextRound>{});
-          generate_permutation(RoundTypeConstant<kRoundAfterNext>{});
-        };
+              generate_permutation(RoundTypeConstant<kCurrentRound>{});
+              generate_permutation(RoundTypeConstant<kNextRound>{});
+              generate_permutation(RoundTypeConstant<kRoundAfterNext>{});
+            };
         auto on_nothing = [&current_round](const auto &) {
           current_round = ordering::nextRejectRound(current_round);
         };
@@ -196,6 +196,7 @@ namespace iroha {
         std::shared_ptr<shared_model::interface::UnsafeProposalFactory>
             proposal_factory,
         std::shared_ptr<ametsuchi::TxPresenceCache> tx_cache,
+        std::shared_ptr<ordering::ProposalCreationStrategy> creation_strategy,
         std::function<std::chrono::milliseconds(
             const synchronizer::SynchronizationEvent &)> delay_func,
         size_t max_number_of_transactions,
@@ -285,6 +286,7 @@ namespace iroha {
           std::move(cache),
           std::move(proposal_factory),
           std::move(tx_cache),
+          std::move(creation_strategy),
           max_number_of_transactions,
           ordering_log_manager->getChild("Gate")->getLogger());
     }
@@ -294,11 +296,13 @@ namespace iroha {
         std::shared_ptr<shared_model::interface::UnsafeProposalFactory>
             proposal_factory,
         std::shared_ptr<ametsuchi::TxPresenceCache> tx_cache,
+        std::shared_ptr<ordering::ProposalCreationStrategy> creation_strategy,
         const logger::LoggerManagerTreePtr &ordering_log_manager) {
       return std::make_shared<ordering::OnDemandOrderingServiceImpl>(
           max_number_of_transactions,
           std::move(proposal_factory),
           std::move(tx_cache),
+          creation_strategy,
           ordering_log_manager->getChild("Service")->getLogger());
     }
 
@@ -325,12 +329,14 @@ namespace iroha {
             proposal_factory,
         std::shared_ptr<TransportFactoryType> proposal_transport_factory,
         std::shared_ptr<ametsuchi::TxPresenceCache> tx_cache,
+        std::shared_ptr<ordering::ProposalCreationStrategy> creation_strategy,
         std::function<std::chrono::milliseconds(
             const synchronizer::SynchronizationEvent &)> delay_func,
         logger::LoggerManagerTreePtr ordering_log_manager) {
       auto ordering_service = createService(max_number_of_transactions,
                                             proposal_factory,
                                             tx_cache,
+                                            creation_strategy,
                                             ordering_log_manager);
       service = std::make_shared<ordering::transport::OnDemandOsServerGrpc>(
           ordering_service,
@@ -348,6 +354,7 @@ namespace iroha {
           std::make_shared<ordering::cache::OnDemandCache>(),
           std::move(proposal_factory),
           std::move(tx_cache),
+          std::move(creation_strategy),
           std::move(delay_func),
           max_number_of_transactions,
           ordering_log_manager);

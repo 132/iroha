@@ -6,7 +6,7 @@
 #ifndef IROHA_SHARED_MODEL_COMMAND_HPP
 #define IROHA_SHARED_MODEL_COMMAND_HPP
 
-#include "interfaces/base/noncopyable_model_primitive.hpp"
+#include "interfaces/base/model_primitive.hpp"
 
 #include <boost/variant/variant_fwd.hpp>
 
@@ -23,18 +23,20 @@ namespace shared_model {
     class CreateRole;
     class DetachRole;
     class GrantPermission;
+    class RemovePeer;
     class RemoveSignatory;
     class RevokePermission;
     class SetAccountDetail;
     class SetQuorum;
     class SubtractAssetQuantity;
     class TransferAsset;
+    class CompareAndSetAccountDetail;
 
     /**
      * Class provides commands container for all commands in system.
      * General note: this class is container for commands, not a base class.
      */
-    class Command : public NonCopyableModelPrimitive<Command> {
+    class Command : public ModelPrimitive<Command> {
      private:
       /// const reference shortcut type
       template <typename... Value>
@@ -57,7 +59,9 @@ namespace shared_model {
                                       SetAccountDetail,
                                       SetQuorum,
                                       SubtractAssetQuantity,
-                                      TransferAsset>;
+                                      TransferAsset,
+                                      RemovePeer,
+                                      CompareAndSetAccountDetail>;
 
       /**
        * @return reference to const variant with concrete command

@@ -25,8 +25,8 @@ namespace shared_model {
       std::unique_ptr<interface::QueryResponse> createAccountDetailResponse(
           interface::types::DetailType account_detail,
           size_t total_number,
-          boost::optional<shared_model::interface::types::AccountDetailRecordId>
-              next_record_id,
+          boost::optional<const shared_model::interface::AccountDetailRecordId
+                              &> next_record_id,
           const crypto::Hash &query_hash) const override;
 
       std::unique_ptr<interface::QueryResponse> createAccountResponse(
@@ -59,13 +59,7 @@ namespace shared_model {
       std::unique_ptr<interface::QueryResponse> createTransactionsPageResponse(
           std::vector<std::unique_ptr<shared_model::interface::Transaction>>
               transactions,
-          const crypto::Hash &next_tx_hash,
-          interface::types::TransactionsNumberType all_transactions_size,
-          const crypto::Hash &query_hash) const override;
-
-      std::unique_ptr<interface::QueryResponse> createTransactionsPageResponse(
-          std::vector<std::unique_ptr<shared_model::interface::Transaction>>
-              transactions,
+          boost::optional<const crypto::Hash &> next_tx_hash,
           interface::types::TransactionsNumberType all_transactions_size,
           const crypto::Hash &query_hash) const override;
 

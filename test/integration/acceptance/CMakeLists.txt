@@ -8,7 +8,7 @@ target_link_libraries(acceptance_fixture
     gtest::gtest
     gmock::gmock
     common_test_constants
-    shared_model_proto_builders
+    shared_model_default_builders
     )
 
 add_library(grantable_permissions_fixture
@@ -19,20 +19,14 @@ target_link_libraries(grantable_permissions_fixture
     integration_framework
     )
 
-addtest(add_asset_qty_test add_asset_qty_test.cpp)
-target_link_libraries(add_asset_qty_test
-    acceptance_fixture
-    integration_framework
-    )
-
 addtest(add_peer_test add_peer_test.cpp)
 target_link_libraries(add_peer_test
     acceptance_fixture
     integration_framework
     )
 
-addtest(create_account_test create_account_test.cpp)
-target_link_libraries(create_account_test
+addtest(remove_peer_test remove_peer_test.cpp)
+target_link_libraries(remove_peer_test
     acceptance_fixture
     integration_framework
     )
@@ -101,22 +95,6 @@ target_link_libraries(tx_heavy_data
     integration_framework
     )
 
-addtest(get_account_assets_test
-    "get_account_assets_test.cpp;\
-query_permission_test_ast.cpp;\
-query_permission_test_base.cpp"
-    )
-target_link_libraries(get_account_assets_test
-    acceptance_fixture
-    integration_framework
-    )
-
-addtest(set_account_detail_test set_account_detail_test.cpp)
-target_link_libraries(set_account_detail_test
-    acceptance_fixture
-    integration_framework
-    )
-
 addtest(get_roles_test get_roles_test.cpp)
 target_link_libraries(get_roles_test
     acceptance_fixture
@@ -149,7 +127,6 @@ addtest(query_permissions_common_test
     "query_permission_common_tests.cpp;\
 query_permission_test_ast_txs.cpp;\
 query_permission_test_base.cpp;\
-query_permission_test_ast.cpp;\
 query_permission_test_acc_details.cpp;\
 query_permission_test_txs.cpp;\
 query_permission_test_signatories.cpp"
@@ -163,14 +140,6 @@ addtest(get_account_test
     get_account_test.cpp
     )
 target_link_libraries(get_account_test
-    acceptance_fixture
-    integration_framework
-    )
-
-addtest(add_signatory_test
-    add_signatory_test.cpp
-    )
-target_link_libraries(add_signatory_test
     acceptance_fixture
     integration_framework
     )

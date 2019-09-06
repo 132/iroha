@@ -7,7 +7,6 @@
 
 #include <libfuzzer/libfuzzer_macro.h>
 
-#include "backend/protobuf/common_objects/proto_common_objects_factory.hpp"
 #include "consensus/round.hpp"
 #include "consensus/yac/cluster_order.hpp"
 #include "consensus/yac/impl/yac_crypto_provider_impl.hpp"
@@ -16,6 +15,7 @@
 #include "consensus/yac/yac.hpp"
 #include "cryptography/crypto_provider/crypto_defaults.hpp"
 #include "framework/test_logger.hpp"
+#include "fuzzing/grpc_servercontext_dtor_segv_workaround.hpp"
 #include "logger/dummy_logger.hpp"
 #include "logger/logger_manager.hpp"
 #include "module/irohad/common/validators_config.hpp"
@@ -31,8 +31,6 @@ using namespace testing;
 namespace fuzzing {
   struct ConsensusFixture {
     std::shared_ptr<iroha::consensus::yac::Timer> timer_;
-    std::shared_ptr<shared_model::interface::CommonObjectsFactory>
-        common_objects_factory_;
     std::shared_ptr<iroha::consensus::yac::YacCryptoProvider> crypto_provider_;
     std::shared_ptr<iroha::consensus::yac::CleanupStrategy> cleanup_strategy_;
     std::function<
@@ -63,14 +61,8 @@ namespace fuzzing {
       network_ = std::make_shared<iroha::consensus::yac::NetworkImpl>(
           async_call_, client_creator_, logger::getDummyLoggerPtr());
 
-      common_objects_factory_ =
-          std::make_shared<shared_model::proto::ProtoCommonObjectsFactory<
-              shared_model::validation::FieldValidator>>(
-              iroha::test::kTestsValidatorsConfig);
-
       crypto_provider_ =
-          std::make_shared<iroha::consensus::yac::CryptoProviderImpl>(
-              keypair_, common_objects_factory_);
+          std::make_shared<iroha::consensus::yac::CryptoProviderImpl>(keypair_);
 
       std::vector<std::shared_ptr<shared_model::interface::Peer>>
           default_peers = [] {

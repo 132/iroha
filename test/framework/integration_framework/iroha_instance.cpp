@@ -8,11 +8,14 @@
 #include <cstdlib>
 #include <sstream>
 
+#include <boost/filesystem.hpp>
+#include "ametsuchi/impl/postgres_options.hpp"
 #include "ametsuchi/storage.hpp"
 #include "cryptography/keypair.hpp"
 #include "framework/config_helper.hpp"
 #include "framework/integration_framework/test_irohad.hpp"
 #include "logger/logger.hpp"
+#include "main/impl/pg_connection_init.hpp"
 
 using namespace std::chrono_literals;
 
@@ -20,18 +23,21 @@ static constexpr std::chrono::milliseconds kMstEmissionPeriod = 100ms;
 
 namespace integration_framework {
 
-  IrohaInstance::IrohaInstance(bool mst_support,
-                               const std::string &block_store_path,
-                               const std::string &listen_ip,
-                               size_t torii_port,
-                               size_t internal_port,
-                               logger::LoggerManagerTreePtr irohad_log_manager,
-                               logger::LoggerPtr log,
-                               const boost::optional<std::string> &dbname)
+  IrohaInstance::IrohaInstance(
+      bool mst_support,
+      const boost::optional<std::string> &block_store_path,
+      const std::string &listen_ip,
+      size_t torii_port,
+      size_t internal_port,
+      logger::LoggerManagerTreePtr irohad_log_manager,
+      logger::LoggerPtr log,
+      const boost::optional<std::string> &dbname,
+      const boost::optional<iroha::torii::TlsParams> &torii_tls_params)
       : block_store_dir_(block_store_path),
-        pg_conn_(getPostgreCredsOrDefault(dbname)),
+        working_dbname_(dbname.value_or(getRandomDbName())),
         listen_ip_(listen_ip),
         torii_port_(torii_port),
+        torii_tls_params_(torii_tls_params),
         internal_port_(internal_port),
         // proposal_timeout results in non-deterministic behavior due
         // to thread scheduling and network
@@ -71,7 +77,9 @@ namespace integration_framework {
 
   void IrohaInstance::rawInsertBlock(
       std::shared_ptr<const shared_model::interface::Block> block) {
-    instance_->storage->insertBlock(block);
+    if (not instance_->storage->insertBlock(block)) {
+      log_->warn("Could not insert block {}!", block->height());
+    }
   }
 
   void IrohaInstance::setMstGossipParams(
@@ -88,22 +96,25 @@ namespace integration_framework {
 
   void IrohaInstance::initPipeline(
       const shared_model::crypto::Keypair &key_pair, size_t max_proposal_size) {
-    instance_ = std::make_shared<TestIrohad>(block_store_dir_,
-                                             pg_conn_,
-                                             listen_ip_,
-                                             torii_port_,
-                                             internal_port_,
-                                             max_proposal_size,
-                                             proposal_delay_,
-                                             vote_delay_,
-                                             mst_expiration_time_,
-                                             key_pair,
-                                             max_rounds_delay_,
-                                             stale_stream_max_rounds_,
-                                             boost::none,
-                                             irohad_log_manager_,
-                                             log_,
-                                             opt_mst_gossip_params_);
+    instance_ = std::make_shared<TestIrohad>(
+        block_store_dir_,
+        std::make_unique<iroha::ametsuchi::PostgresOptions>(
+            getPostgresCredsOrDefault(), working_dbname_, log_),
+        listen_ip_,
+        torii_port_,
+        internal_port_,
+        max_proposal_size,
+        proposal_delay_,
+        vote_delay_,
+        mst_expiration_time_,
+        key_pair,
+        max_rounds_delay_,
+        stale_stream_max_rounds_,
+        boost::none,
+        irohad_log_manager_,
+        log_,
+        opt_mst_gossip_params_,
+        torii_tls_params_);
   }
 
   void IrohaInstance::run() {
@@ -118,18 +129,21 @@ namespace integration_framework {
     return instance_;
   }
 
-  std::string IrohaInstance::getPostgreCredsOrDefault(
-      const boost::optional<std::string> &dbname) {
-    std::string db = " dbname=";
-    if (dbname) {
-      db += dbname.value();
-    } else {
-      db += "db"
-          + boost::uuids::to_string(boost::uuids::random_generator()())
-                .substr(0, 8);
+  void IrohaInstance::terminateAndCleanup() {
+    if (not instance_ or not instance_->storage) {
+      log_->warn("Iroha instance or its storage are not initialized");
+      return;
     }
-
-    return integration_framework::getPostgresCredsOrDefault() + db;
+    auto storage = instance_->storage;
+    log_->info("stopping irohad");
+    instance_.reset();
+    log_->info("removing storage");
+    storage->dropStorage();  // dropStorage must be called after Synchronizer
+                             // and Simulator are destroyed, because they hold
+                             // database sessions
+    if (block_store_dir_) {
+      boost::filesystem::remove_all(block_store_dir_.value());
+    }
   }
 
 }  // namespace integration_framework

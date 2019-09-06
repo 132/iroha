@@ -7,6 +7,7 @@
 #define IROHA_ABSTRACT_TX_RESPONSE_HPP
 
 #include "interfaces/base/model_primitive.hpp"
+
 #include "utils/string_builder.hpp"
 
 namespace shared_model {

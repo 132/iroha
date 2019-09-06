@@ -15,13 +15,16 @@ namespace iroha {
       namespace detail {
         /// The free parameter of Kf+1 consistency model for CFT.
         constexpr unsigned int kSupermajorityCheckerKfPlus1Cft = 2;
-      }
+      }  // namespace detail
 
       /// An implementation of CFT supermajority checker.
       class SupermajorityCheckerCft : public SupermajorityChecker {
        public:
         bool hasSupermajority(PeersNumberType current,
                               PeersNumberType all) const override;
+
+        bool isTolerated(PeersNumberType number,
+                         PeersNumberType all) const override;
 
         bool canHaveSupermajority(const VoteGroups &votes,
                                   PeersNumberType all) const override;

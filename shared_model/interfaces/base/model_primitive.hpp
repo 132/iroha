@@ -9,7 +9,6 @@
 #include <ciso646>
 
 #include "utils/string_builder.hpp"
-#include "common/cloneable.hpp"
 
 namespace shared_model {
   namespace interface {
@@ -20,7 +19,7 @@ namespace shared_model {
      * @tparam Model - your new style model
      */
     template <typename Model>
-    class ModelPrimitive : public Cloneable<ModelPrimitive<Model>> {
+    class ModelPrimitive {
      public:
       /**
        * Reference for model type.

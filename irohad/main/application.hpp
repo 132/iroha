@@ -16,16 +16,21 @@
 #include "logger/logger_manager_fwd.hpp"
 #include "main/impl/block_loader_init.hpp"
 #include "main/impl/on_demand_ordering_init.hpp"
+#include "main/server_runner.hpp"
 #include "multi_sig_transactions/gossip_propagation_strategy_params.hpp"
+#include "torii/tls_params.hpp"
 
 namespace iroha {
   class PendingTransactionStorage;
+  class PendingTransactionStorageInit;
   class MstProcessor;
   namespace ametsuchi {
     class WsvRestorer;
     class TxPresenceCache;
     class Storage;
     class ReconnectionStrategyFactory;
+    class PostgresOptions;
+    struct PoolWrapper;
   }  // namespace ametsuchi
   namespace consensus {
     namespace yac {
@@ -51,6 +56,8 @@ namespace iroha {
     class CommandService;
     class CommandServiceTransportGrpc;
     class QueryService;
+
+    struct TlsParams;
   }  // namespace torii
   namespace validation {
     class ChainValidator;
@@ -63,13 +70,10 @@ namespace shared_model {
     class Keypair;
   }
   namespace interface {
-    class CommonObjectsFactory;
     class QueryResponseFactory;
     class TransactionBatchFactory;
   }  // namespace interface
 }  // namespace shared_model
-
-class ServerRunner;
 
 class Irohad {
  public:
@@ -78,7 +82,7 @@ class Irohad {
   /**
    * Constructor that initializes common iroha pipeline
    * @param block_store_dir - folder where blocks will be stored
-   * @param pg_conn - initialization string for postgre
+   * @param pg_opt - connection options for PostgresSQL
    * @param listen_ip - ip address for opening ports (internal & torii)
    * @param torii_port - port for torii binding
    * @param internal_port - port for internal communication - ordering service,
@@ -99,9 +103,11 @@ class Irohad {
    * @param opt_mst_gossip_params - parameters for Gossip MST propagation
    * (optional). If not provided, disables mst processing support
    * TODO mboldyrev 03.11.2018 IR-1844 Refactor the constructor.
+   * @param torii_tls_params - optional TLS params for torii.
+   * @see iroha::torii::TlsParams
    */
-  Irohad(const std::string &block_store_dir,
-         const std::string &pg_conn,
+  Irohad(const boost::optional<std::string> &block_store_dir,
+         std::unique_ptr<iroha::ametsuchi::PostgresOptions> pg_opt,
          const std::string &listen_ip,
          size_t torii_port,
          size_t internal_port,
@@ -116,7 +122,9 @@ class Irohad {
              opt_alternative_peers,
          logger::LoggerManagerTreePtr logger_manager,
          const boost::optional<iroha::GossipPropagationStrategyParams>
-             &opt_mst_gossip_params = boost::none);
+             &opt_mst_gossip_params = boost::none,
+         const boost::optional<iroha::torii::TlsParams> &torii_tls_params =
+             boost::none);
 
   /**
    * Initialization of whole objects in system
@@ -152,7 +160,8 @@ class Irohad {
 
  protected:
   // -----------------------| component initialization |------------------------
-  virtual RunResult initStorage();
+  virtual RunResult initStorage(
+      std::unique_ptr<iroha::ametsuchi::PostgresOptions> pg_opt);
 
   virtual RunResult initCryptoProvider();
 
@@ -196,10 +205,10 @@ class Irohad {
   virtual RunResult initWsvRestorer();
 
   // constructor dependencies
-  std::string block_store_dir_;
-  std::string pg_conn_;
+  const boost::optional<std::string> block_store_dir_;
   const std::string listen_ip_;
   size_t torii_port_;
+  boost::optional<iroha::torii::TlsParams> torii_tls_params_;
   size_t internal_port_;
   size_t max_proposal_size_;
   std::chrono::milliseconds proposal_delay_;
@@ -213,6 +222,16 @@ class Irohad {
   boost::optional<iroha::GossipPropagationStrategyParams>
       opt_mst_gossip_params_;
 
+  std::unique_ptr<iroha::PendingTransactionStorageInit>
+      pending_txs_storage_init;
+
+  // pending transactions storage
+  std::shared_ptr<iroha::PendingTransactionStorage> pending_txs_storage_;
+
+  // query response factory
+  std::shared_ptr<shared_model::interface::QueryResponseFactory>
+      query_response_factory_;
+
   // ------------------------| internal dependencies |-------------------------
  public:
   shared_model::crypto::Keypair keypair;
@@ -224,9 +243,7 @@ class Irohad {
   std::unique_ptr<iroha::consensus::yac::YacInit> yac_init;
   iroha::network::BlockLoaderInit loader_init;
 
-  // common objects factory
-  std::shared_ptr<shared_model::interface::CommonObjectsFactory>
-      common_objects_factory_;
+  std::shared_ptr<iroha::ametsuchi::PoolWrapper> pool_wrapper_;
 
   // WSV restorer
   std::shared_ptr<iroha::ametsuchi::WsvRestorer> wsv_restorer_;
@@ -242,6 +259,8 @@ class Irohad {
   // validators
   std::shared_ptr<shared_model::validation::ValidatorsConfig>
       validators_config_;
+  std::shared_ptr<shared_model::validation::ValidatorsConfig>
+      proposal_validators_config_;
   std::shared_ptr<shared_model::validation::ValidatorsConfig>
       block_validators_config_;
   std::shared_ptr<iroha::validation::StatefulValidator> stateful_validator;
@@ -260,10 +279,6 @@ class Irohad {
       shared_model::interface::Transaction,
       iroha::protocol::Transaction>>
       transaction_factory;
-
-  // query response factory
-  std::shared_ptr<shared_model::interface::QueryResponseFactory>
-      query_response_factory_;
 
   // query factory
   std::shared_ptr<shared_model::interface::AbstractTransportFactory<
@@ -302,12 +317,6 @@ class Irohad {
   // synchronizer
   std::shared_ptr<iroha::synchronizer::Synchronizer> synchronizer;
 
-  // consensus gate
-  std::shared_ptr<iroha::network::ConsensusGate> consensus_gate;
-  rxcpp::composite_subscription consensus_gate_objects_lifetime;
-  rxcpp::subjects::subject<iroha::consensus::GateObject> consensus_gate_objects;
-  rxcpp::composite_subscription consensus_gate_events_subscription;
-
   // pcs
   std::shared_ptr<iroha::network::PeerCommunicationService> pcs;
 
@@ -318,9 +327,6 @@ class Irohad {
   std::shared_ptr<iroha::network::MstTransport> mst_transport;
   std::shared_ptr<iroha::MstProcessor> mst_processor;
 
-  // pending transactions storage
-  std::shared_ptr<iroha::PendingTransactionStorage> pending_txs_storage_;
-
   // transaction service
   std::shared_ptr<iroha::torii::CommandService> command_service;
   std::shared_ptr<iroha::torii::CommandServiceTransportGrpc>
@@ -329,7 +335,14 @@ class Irohad {
   // query service
   std::shared_ptr<iroha::torii::QueryService> query_service;
 
+  // consensus gate
+  std::shared_ptr<iroha::network::ConsensusGate> consensus_gate;
+  rxcpp::composite_subscription consensus_gate_objects_lifetime;
+  rxcpp::subjects::subject<iroha::consensus::GateObject> consensus_gate_objects;
+  rxcpp::composite_subscription consensus_gate_events_subscription;
+
   std::unique_ptr<ServerRunner> torii_server;
+  boost::optional<std::unique_ptr<ServerRunner>> torii_tls_server = boost::none;
   std::unique_ptr<ServerRunner> internal_server;
 
   logger::LoggerManagerTreePtr log_manager_;  ///< application root log manager

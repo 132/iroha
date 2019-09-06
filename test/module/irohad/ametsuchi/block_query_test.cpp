@@ -8,14 +8,16 @@
 #include <boost/filesystem.hpp>
 #include <boost/optional.hpp>
 #include "ametsuchi/impl/flat_file/flat_file.hpp"
+#include "ametsuchi/impl/flat_file_block_storage_factory.hpp"
 #include "ametsuchi/impl/postgres_block_index.hpp"
+#include "ametsuchi/impl/postgres_indexer.hpp"
 #include "backend/protobuf/proto_block_json_converter.hpp"
 #include "common/byteutils.hpp"
 #include "converters/protobuf/json_proto_converter.hpp"
 #include "framework/result_fixture.hpp"
 #include "framework/test_logger.hpp"
 #include "module/irohad/ametsuchi/ametsuchi_fixture.hpp"
-#include "module/irohad/ametsuchi/mock_key_value_storage.hpp"
+#include "module/irohad/ametsuchi/mock_block_storage.hpp"
 #include "module/shared_model/builders/protobuf/test_block_builder.hpp"
 #include "module/shared_model/builders/protobuf/test_transaction_builder.hpp"
 
@@ -31,19 +33,20 @@ class BlockQueryTest : public AmetsuchiTest {
     auto tmp = FlatFile::create(block_store_path, getTestLogger("FlatFile"));
     ASSERT_TRUE(tmp);
     file = std::move(*tmp);
-    mock_file = std::make_shared<MockKeyValueStorage>();
+    mock_block_storage = std::make_shared<MockBlockStorage>();
     sql = std::make_unique<soci::session>(*soci::factory_postgresql(), pgopt_);
 
-    index =
-        std::make_shared<PostgresBlockIndex>(*sql, getTestLogger("BlockIndex"));
+    index = std::make_shared<PostgresBlockIndex>(
+        std::make_unique<PostgresIndexer>(*sql), getTestLogger("BlockIndex"));
     auto converter =
         std::make_shared<shared_model::proto::ProtoBlockJsonConverter>();
+    auto block_storage_factory = std::make_unique<FlatFileBlockStorageFactory>(
+        []() { return block_store_path; }, converter, getTestLoggerManager());
+    block_storage = block_storage_factory->create();
     blocks = std::make_shared<PostgresBlockQuery>(
-        *sql, *file, converter, getTestLogger("BlockQuery"));
+        *sql, *block_storage, getTestLogger("BlockQuery"));
     empty_blocks = std::make_shared<PostgresBlockQuery>(
-        *sql, *mock_file, converter, getTestLogger("PostgresBlockQueryEmpty"));
-
-    *sql << init_;
+        *sql, *mock_block_storage, getTestLogger("PostgresBlockQueryEmpty"));
 
     // First transaction in block1
     auto txn1_1 = TestTransactionBuilder().creatorAccountId(creator1).build();
@@ -105,8 +108,9 @@ class BlockQueryTest : public AmetsuchiTest {
   std::shared_ptr<BlockQuery> blocks;
   std::shared_ptr<BlockQuery> empty_blocks;
   std::shared_ptr<BlockIndex> index;
+  std::unique_ptr<BlockStorage> block_storage;
+  std::shared_ptr<MockBlockStorage> mock_block_storage;
   std::unique_ptr<FlatFile> file;
-  std::shared_ptr<MockKeyValueStorage> mock_file;
   std::string creator1 = "user1@test";
   std::string creator2 = "user2@test";
   std::size_t blocks_total{0};
@@ -127,7 +131,9 @@ TEST_F(BlockQueryTest, GetNonExistentBlock) {
         FAIL() << "Nonexistent block request matched value "
                << v.value->toString();
       },
-      [](auto &&e) { SUCCEED(); });
+      [](auto &&e) {
+        EXPECT_EQ(e.error.code, BlockQuery::GetBlockError::Code::kNoBlock);
+      });
 }
 
 /**
@@ -140,8 +146,8 @@ TEST_F(BlockQueryTest, GetExactlyOneBlock) {
   auto stored_block = blocks->getBlock(1);
   stored_block.match([](auto &&v) { SUCCEED(); },
                      [](auto &&e) {
-                       FAIL() << "Existing block request matched error "
-                              << e.error;
+                       FAIL() << "Existing block request failed: "
+                              << e.error.message;
                      });
 }
 
@@ -158,9 +164,12 @@ TEST_F(BlockQueryTest, GetZeroBlock) {
         FAIL() << "Nonexistent block request matched value "
                << v.value->toString();
       },
-      [](auto &&e) { SUCCEED(); });
+      [](auto &&e) {
+        EXPECT_EQ(e.error.code, BlockQuery::GetBlockError::Code::kNoBlock);
+      });
 }
 
+// TODO: luckychess 05.08.2019 IR-595 Unit tests for ProtoBlockJsonConverter
 /**
  * @given block store with 2 blocks totally containing 3 txs created by
  * user1@test AND 1 tx created by user2@test. Block #1 is filled with trash data
@@ -185,7 +194,9 @@ TEST_F(BlockQueryTest, GetBlockButItIsNotJSON) {
         FAIL() << "Nonexistent block request matched value "
                << v.value->toString();
       },
-      [](auto &&e) { SUCCEED(); });
+      [](auto &&e) {
+        EXPECT_EQ(e.error.code, BlockQuery::GetBlockError::Code::kNoBlock);
+      });
 }
 
 /**
@@ -215,7 +226,9 @@ TEST_F(BlockQueryTest, GetBlockButItIsInvalidBlock) {
         FAIL() << "Nonexistent block request matched value "
                << v.value->toString();
       },
-      [](auto &&e) { SUCCEED(); });
+      [](auto &&e) {
+        EXPECT_EQ(e.error.code, BlockQuery::GetBlockError::Code::kNoBlock);
+      });
 }
 
 /**
@@ -277,18 +290,16 @@ TEST_F(BlockQueryTest, GetTopBlockSuccess) {
 /**
  * @given empty block store
  * @when getTopBlock is invoked on this block store
- * @then result must be a string error, because no block was fetched
+ * @then result must be a kNoBlock error, because no block was fetched
  */
 TEST_F(BlockQueryTest, GetTopBlockFail) {
-  EXPECT_CALL(*mock_file, last_id()).WillRepeatedly(Return(0));
-  EXPECT_CALL(*mock_file, get(mock_file->last_id()))
+  EXPECT_CALL(*mock_block_storage, size()).WillRepeatedly(Return(0));
+  EXPECT_CALL(*mock_block_storage, fetch(mock_block_storage->size()))
       .WillOnce(Return(boost::none));
 
-  auto top_block_error = framework::expected::err(
+  auto top_block_error = iroha::expected::resultToOptionalError(
       empty_blocks->getBlock(empty_blocks->getTopBlockHeight()));
   ASSERT_TRUE(top_block_error);
-  auto expected_error =
-      boost::format("Failed to retrieve block with height %d");
-  ASSERT_EQ(top_block_error.value().error,
-            (expected_error % mock_file->last_id()).str());
+  ASSERT_EQ(top_block_error.value().code,
+            BlockQuery::GetBlockError::Code::kNoBlock);
 }

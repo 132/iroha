@@ -8,6 +8,7 @@
 #include "ametsuchi/block_query.hpp"
 #include "ametsuchi/block_storage.hpp"
 #include "ametsuchi/block_storage_factory.hpp"
+#include "ametsuchi/command_executor.hpp"
 #include "ametsuchi/mutable_storage.hpp"
 #include "ametsuchi/storage.hpp"
 #include "interfaces/iroha_internal/block.hpp"
@@ -74,18 +75,20 @@ namespace {
     // apply all blocks starting from the genesis
     auto top_height = block_query->getTopBlockHeight();
     for (decltype(top_height) i = 1; i <= top_height; ++i) {
-      auto block_result = block_query->getBlock(i);
-      auto result = std::move(block_result) | [&mutable_storage](auto &&block)
-          -> iroha::expected::Result<void, std::string> {
-        if (not mutable_storage->apply(std::move(block))) {
-          return iroha::expected::makeError("Cannot apply "
-                                            + block->toString());
-        }
-        return iroha::expected::Value<void>();
-      };
+      auto result = block_query->getBlock(i).match(
+          [&mutable_storage](
+              auto &&block) -> iroha::expected::Result<void, std::string> {
+            if (not mutable_storage->apply(std::move(block).value)) {
+              return iroha::expected::makeError("Cannot apply block!");
+            }
+            return iroha::expected::Value<void>();
+          },
+          [](auto &&err) -> iroha::expected::Result<void, std::string> {
+            return std::move(err).error.message;
+          });
 
-      if (auto e = boost::get<iroha::expected::Error<std::string>>(&result)) {
-        return *e;
+      if (auto e = iroha::expected::resultToOptionalError(result)) {
+        return std::move(e).value();
       }
     }
 
@@ -96,10 +99,12 @@ namespace {
 namespace iroha {
   namespace ametsuchi {
     CommitResult WsvRestorerImpl::restoreWsv(Storage &storage) {
-      BlockStorageStubFactory storage_factory;
+      return storage.createCommandExecutor() |
+                 [&storage](auto &&command_executor) -> CommitResult {
+        BlockStorageStubFactory storage_factory;
 
-      return storage.createMutableStorage(storage_factory) |
-                 [&storage](auto &&mutable_storage) -> CommitResult {
+        auto mutable_storage = storage.createMutableStorage(
+            std::move(command_executor), storage_factory);
         auto block_query = storage.getBlockQuery();
         if (not block_query) {
           return expected::makeError("Cannot create BlockQuery");

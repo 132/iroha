@@ -18,6 +18,7 @@ namespace common_constants {
 
   // role names
   const std::string kAdminRole = "admin_role";
+  const std::string kMoneyCreator = "money_creator";
   const std::string kDefaultRole = "default_role";
   const std::string kRole = "user_role";
 
@@ -34,6 +35,7 @@ namespace common_constants {
   const std::string kSameDomainUserId = kAnotherUser + "@" + kDomain;
   const std::string kAnotherDomainUserId = kAnotherUser + "@" + kSecondDomain;
   const std::string kAssetId = kAssetName + "#" + kDomain;
+  const std::string kSecondDomainAssetId = kAssetName + "#" + kSecondDomain;
 
   // keypairs
   const Keypair kAdminKeypair = DefaultCryptoAlgorithmType::generateKeypair();
@@ -42,4 +44,12 @@ namespace common_constants {
       DefaultCryptoAlgorithmType::generateKeypair();
   const Keypair kAnotherDomainUserKeypair =
       DefaultCryptoAlgorithmType::generateKeypair();
-}
+
+  // misc
+  const shared_model::interface::Amount kAmountPrec1Max{
+      "1157920892373161954235709850086879078532"
+      "6998466564056403945758400791312963993.5"};  // (2**256 - 1) / 10**1
+  const shared_model::interface::Amount kAmountPrec2Max{
+      "1157920892373161954235709850086879078532"
+      "699846656405640394575840079131296399.35"};  // (2**256 - 1) / 10**2
+}  // namespace common_constants
